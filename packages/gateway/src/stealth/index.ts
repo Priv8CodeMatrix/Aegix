@@ -613,6 +613,12 @@ export async function decryptPoolKey(poolId: string): Promise<Keypair | null> {
   if (!pool) return null;
   
   try {
+    // Ensure required encryption fields exist
+    if (!pool.encryptedSecretKey || !pool.creationSignature || !pool.encryptionSalt) {
+      console.error(`[Pool] Missing encryption fields for ${poolId}`);
+      return null;
+    }
+    
     const secretKey = decryptPrivateKey(
       pool.encryptedSecretKey,
       pool.owner,
@@ -752,6 +758,11 @@ export async function executePoolPayment(
   
   if (pool.status === 'created') {
     return { success: false, error: 'Pool not funded yet' };
+  }
+  
+  // Ensure pool has required encryption fields
+  if (!pool.creationSignature) {
+    return { success: false, error: 'Pool missing encryption credentials - please re-authenticate' };
   }
   
   // Decrypt pool keypair

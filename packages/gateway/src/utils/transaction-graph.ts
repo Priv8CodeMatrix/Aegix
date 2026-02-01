@@ -107,7 +107,7 @@ export async function parseTransactionGraph(
     const nodeIds = new Set<string>();
 
     // Get transaction metadata
-    const metadata = {
+    const metadata: TransactionGraph['metadata'] = {
       signature,
       timestamp: tx.blockTime ? tx.blockTime * 1000 : undefined,
       fee: tx.meta?.fee,
