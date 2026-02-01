@@ -1545,15 +1545,16 @@ export async function decompressAndTransfer(
   const estimatedCost = 0.005;
   
   // Check rate limit first (fast check, no RPC calls)
-  // SECURITY: Rate limit by Recovery Pool address (constant across all operations)
+  // SECURITY: Rate limit by Recovery Pool address (unique per user)
   // This prevents bypass by generating new ephemeral burner keypairs
-  if (!checkDecompressRateLimit(recoveryPubkey.toBase58())) {
+  const recoveryOwner = recoveryPubkey.toBase58(); // Use recovery pool address as owner key
+  if (!checkDecompressRateLimit(recoveryOwner)) {
     throw new Error('Rate limit exceeded: too many decompress requests per minute');
   }
   
-  // Reserve liquidity atomically
-  if (!await reserveLiquidity(estimatedCost, txId)) {
-    throw new Error('Insufficient Recovery Pool liquidity - please top up the Recovery Pool');
+  // Reserve liquidity atomically (per-user)
+  if (!await reserveLiquidity(recoveryOwner, estimatedCost, txId)) {
+    throw new Error('Insufficient Recovery Pool liquidity - please top up your Recovery Pool');
   }
   
   // Wrap entire operation in try/finally to ensure reservation is always released
@@ -2026,8 +2027,8 @@ export async function decompressAndTransfer(
   };
   
   } finally {
-    // SECURITY: Always release the liquidity reservation
-    releaseReservation(txId);
+    // SECURITY: Always release the liquidity reservation (per-user)
+    releaseReservation(recoveryOwner, txId);
   }
 }
 

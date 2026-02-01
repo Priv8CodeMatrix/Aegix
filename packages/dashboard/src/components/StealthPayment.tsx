@@ -230,11 +230,14 @@ export default function StealthPayment({
     }
   };
 
-  // Check Recovery Pool status (fetches from backend)
+  // Check Recovery Pool status (per-user - fetches from backend)
   const checkRecoveryPool = async () => {
+    if (!publicKey) return;
+    
     try {
       const GATEWAY_URL = process.env.NEXT_PUBLIC_GATEWAY_URL || 'http://localhost:3001';
-      const response = await fetch(`${GATEWAY_URL}/api/credits/recovery/status`);
+      // Pass owner wallet address to get this user's Recovery Pool
+      const response = await fetch(`${GATEWAY_URL}/api/credits/recovery/status?owner=${publicKey.toBase58()}`);
       const result = await response.json();
       
       if (result.success && result.data) {
@@ -242,7 +245,7 @@ export default function StealthPayment({
           initialized: result.data.initialized ?? true,
           address: result.data.address,
           balance: result.data.balance,
-          isHealthy: result.data.isHealthy,
+          isHealthy: result.data.isHealthy && !result.data.isLocked,
           status: result.data.status,
         });
       }
@@ -1071,7 +1074,7 @@ export default function StealthPayment({
             <span className="text-xs font-mono text-status-warning">RECOVERY_POOL NOT INITIALIZED</span>
           </div>
           <p className="text-[10px] text-slate-400">
-            Initialize the Recovery Pool in Stealth Pool Channel to enable privacy payments.
+            Initialize your Recovery Pool in Stealth Pool Channel to enable privacy payments.
           </p>
         </div>
       );
@@ -1982,7 +1985,7 @@ export default function StealthPayment({
                 <div className="flex items-center gap-2 p-2 border border-status-warning/30 bg-status-warning/5">
                   <AlertCircle className="w-4 h-4 text-status-warning" />
                   <span className="text-[10px] text-status-warning font-mono">
-                    Recovery Pool not initialized. Initialize in Stealth Pool Channel.
+                    Your Recovery Pool not initialized. Initialize in Stealth Pool Channel.
                   </span>
                 </div>
               )}

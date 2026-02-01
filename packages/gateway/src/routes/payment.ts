@@ -3079,33 +3079,35 @@ router.post('/pool/pay', async (req: Request, res: Response) => {
     
     let transfer2Result: { decompressTx: string; transferTx: string; recipientAta: string };
     try {
-      // Import Recovery Pool and decompressAndTransfer
-      const { initRecoveryPool, validateRecoveryLiquidity, getRecoveryPoolStatus, isRecoveryPoolInitialized, loadRecoveryPool } = await import('../solana/recovery.js');
+      // Import Recovery Pool (per-user) and decompressAndTransfer
+      const { getRecoveryPoolKeypair, validateRecoveryLiquidity, getRecoveryPoolStatus, hasRecoveryPool, setRecoveryConnection } = await import('../solana/recovery.js');
       const { decompressAndTransfer, getRegularConnection } = await import('../light/client.js');
       
       // Get connection
       const regularConn = getRegularConnection();
+      setRecoveryConnection(regularConn);
       
-      // Load Recovery Pool from disk/env
-      await loadRecoveryPool(regularConn);
-      
-      // Check if Recovery Pool is initialized
-      if (!isRecoveryPoolInitialized()) {
-        console.error(`[Pool] Recovery Pool NOT INITIALIZED!`);
-        throw new Error('Recovery Pool not initialized. Please initialize it in the dashboard first and fund it with SOL.');
+      // Check if user has a Recovery Pool
+      if (!hasRecoveryPool(owner)) {
+        console.error(`[Pool] No Recovery Pool for ${owner.slice(0, 8)}...`);
+        throw new Error('Recovery Pool not initialized. Please create one in the dashboard first and fund it with SOL.');
       }
       
-      // Get the keypair
-      const recoveryKeypair = await initRecoveryPool(regularConn);
-      
-      // Validate Recovery Pool has enough liquidity
-      const liquidity = await validateRecoveryLiquidity(regularConn);
+      // Validate user's Recovery Pool has enough liquidity
+      const liquidity = await validateRecoveryLiquidity(owner, regularConn);
+      if (liquidity.isLocked) {
+        console.error(`[Pool] Recovery Pool locked for ${owner.slice(0, 8)}...`);
+        throw new Error('Recovery Pool is locked. Please re-authenticate in the dashboard.');
+      }
       if (!liquidity.valid) {
         console.error(`[Pool] Recovery Pool insufficient: ${liquidity.balance} SOL (need ${liquidity.required} SOL)`);
-        throw new Error(`Recovery Pool needs ${liquidity.shortfall?.toFixed(4)} more SOL. Please top up Recovery Pool.`);
+        throw new Error(`Recovery Pool needs ${liquidity.shortfall?.toFixed(4)} more SOL. Please top up your Recovery Pool.`);
       }
       
-      const recoveryStatus = await getRecoveryPoolStatus(regularConn);
+      // Get the user's Recovery Pool keypair
+      const recoveryKeypair = getRecoveryPoolKeypair(owner);
+      
+      const recoveryStatus = await getRecoveryPoolStatus(owner, regularConn);
       console.log(`[Pool]   Recovery Pool: ${recoveryStatus.address?.slice(0, 12) || 'N/A'}...`);
       console.log(`[Pool]   Recovery Balance: ${recoveryStatus.balance.toFixed(4)} SOL`);
       console.log(`[Pool]   Total Recycled: ${recoveryStatus.totalRecycled.toFixed(4)} SOL`);
@@ -4874,25 +4876,35 @@ router.get('/light/estimate', async (req: Request, res: Response) => {
 });
 
 // =============================================================================
-// RECOVERY POOL ENDPOINTS
+// RECOVERY POOL ENDPOINTS (Per-User)
 // =============================================================================
 
 /**
  * GET /api/credits/recovery/status
- * Get Recovery Pool status (address, balance, health)
+ * Get Recovery Pool status for a specific owner
+ * Query params: owner (required) - wallet address
  */
 router.get('/recovery/status', async (req: Request, res: Response) => {
   try {
-    const { loadRecoveryPool, getRecoveryPoolStatus, isRecoveryPoolInitialized } = await import('../solana/recovery.js');
+    const { owner } = req.query;
+    
+    if (!owner || typeof owner !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Owner wallet address required',
+        hint: 'Add ?owner=YOUR_WALLET_ADDRESS to the request',
+      });
+    }
+    
+    const { getRecoveryPoolStatus, setRecoveryConnection } = await import('../solana/recovery.js');
     const { getRegularConnection } = await import('../light/client.js');
     
     const conn = getRegularConnection();
+    setRecoveryConnection(conn);
     
-    // Try to load (won't create new one)
-    await loadRecoveryPool(conn);
+    const status = await getRecoveryPoolStatus(owner, conn);
     
-    // Check if initialized
-    if (!isRecoveryPoolInitialized()) {
+    if (!status.initialized) {
       return res.json({
         success: true,
         data: {
@@ -4906,13 +4918,12 @@ router.get('/recovery/status', async (req: Request, res: Response) => {
           minRequired: 0.005,
           minRequiredFormatted: '0.0050 SOL',
           status: 'NOT_INITIALIZED',
+          isLocked: false,
           message: 'Recovery Pool not created. Click Initialize to create one.',
         },
         timestamp: Date.now(),
       });
     }
-    
-    const status = await getRecoveryPoolStatus(conn);
     
     res.json({
       success: true,
@@ -4926,7 +4937,9 @@ router.get('/recovery/status', async (req: Request, res: Response) => {
         totalRecycledFormatted: `${status.totalRecycled.toFixed(4)} SOL`,
         minRequired: status.minRequired,
         minRequiredFormatted: `${status.minRequired.toFixed(4)} SOL`,
-        status: status.isHealthy ? 'HEALTHY' : 'NEEDS_FUNDING',
+        status: status.isLocked ? 'LOCKED' : (status.isHealthy ? 'HEALTHY' : 'NEEDS_FUNDING'),
+        isLocked: status.isLocked,
+        poolId: status.poolId,
       },
       timestamp: Date.now(),
     });
@@ -4941,47 +4954,62 @@ router.get('/recovery/status', async (req: Request, res: Response) => {
 
 /**
  * POST /api/credits/recovery/initialize
- * Create a new Recovery Pool (generates keypair, user must fund it)
+ * Create a new Recovery Pool for a user (requires wallet signature)
+ * Body: { owner: string, signature: string }
  */
 router.post('/recovery/initialize', async (req: Request, res: Response) => {
   try {
-    const { createRecoveryPool, isRecoveryPoolInitialized, getRecoveryPoolStatus } = await import('../solana/recovery.js');
-    const { getRegularConnection } = await import('../light/client.js');
+    const { owner, signature } = req.body;
     
-    const conn = getRegularConnection();
-    
-    // Check if already initialized
-    if (isRecoveryPoolInitialized()) {
-      const status = await getRecoveryPoolStatus(conn);
-      return res.json({
-        success: true,
-        data: {
-          alreadyExists: true,
-          address: status.address,
-          balance: status.balance,
-          message: 'Recovery Pool already exists. Fund this address with SOL.',
-        },
-        timestamp: Date.now(),
+    if (!owner || typeof owner !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Owner wallet address required',
       });
     }
     
-    // Create new Recovery Pool
-    const result = await createRecoveryPool(conn);
+    if (!signature || typeof signature !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Wallet signature required to create Recovery Pool',
+        hint: 'Sign a message with your wallet to prove ownership',
+      });
+    }
     
-    console.log(`[Recovery] ✓ New Recovery Pool created: ${result.address}`);
+    const { createRecoveryPool, getRecoveryPoolStatus, setRecoveryConnection } = await import('../solana/recovery.js');
+    const { getRegularConnection } = await import('../light/client.js');
+    
+    const conn = getRegularConnection();
+    setRecoveryConnection(conn);
+    
+    // Create Recovery Pool for this owner
+    const result = await createRecoveryPool(owner, signature, conn);
+    
+    if (!result.success) {
+      return res.status(400).json({
+        success: false,
+        error: result.error || 'Failed to create Recovery Pool',
+      });
+    }
+    
+    console.log(`[Recovery] ✓ Recovery Pool created for ${owner.slice(0, 8)}...: ${result.address}`);
+    
+    // Get updated status
+    const status = await getRecoveryPoolStatus(owner, conn);
     
     res.json({
       success: true,
       data: {
-        alreadyExists: false,
+        alreadyExists: result.message.includes('already exists') || result.message.includes('unlocked'),
         address: result.address,
-        balance: 0,
+        balance: status.balance,
         minRequired: 0.005,
+        poolId: result.poolId,
         message: result.message,
         instructions: [
           `1. Copy the address: ${result.address}`,
           '2. Send at least 0.01 SOL to this address',
-          '3. The Recovery Pool will pay fees for privacy payments',
+          '3. Your Recovery Pool will pay fees for your privacy payments',
           '4. Top up when balance gets low',
         ],
       },
@@ -4997,23 +5025,74 @@ router.post('/recovery/initialize', async (req: Request, res: Response) => {
 });
 
 /**
- * POST /api/credits/recovery/sweep
- * Sweep rent from empty burner ATAs back to Recovery Pool
- * Note: This requires storing burner keypairs temporarily
+ * POST /api/credits/recovery/unlock
+ * Unlock a locked Recovery Pool (re-authenticate with signature)
+ * Body: { owner: string, signature: string }
  */
-router.post('/recovery/sweep', async (req: Request, res: Response) => {
+router.post('/recovery/unlock', async (req: Request, res: Response) => {
   try {
-    const { sweepBurnerRent, getRecoveryPoolStatus } = await import('../solana/recovery.js');
+    const { owner, signature } = req.body;
+    
+    if (!owner || !signature) {
+      return res.status(400).json({
+        success: false,
+        error: 'Owner and signature required',
+      });
+    }
+    
+    const { unlockRecoveryPool, getRecoveryPoolStatus, setRecoveryConnection } = await import('../solana/recovery.js');
     const { getRegularConnection } = await import('../light/client.js');
     
     const conn = getRegularConnection();
+    setRecoveryConnection(conn);
     
-    // For now, we don't persist burner keypairs, so sweep won't find any
-    // In a full implementation, you'd store burner keypairs temporarily
-    // and sweep them periodically
+    await unlockRecoveryPool(owner, signature);
+    
+    const status = await getRecoveryPoolStatus(owner, conn);
+    
+    res.json({
+      success: true,
+      data: {
+        address: status.address,
+        balance: status.balance,
+        isHealthy: status.isHealthy,
+        message: 'Recovery Pool unlocked successfully',
+      },
+      timestamp: Date.now(),
+    });
+  } catch (error: any) {
+    console.error('[Recovery] Unlock error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to unlock Recovery Pool',
+    });
+  }
+});
+
+/**
+ * POST /api/credits/recovery/sweep
+ * Sweep rent from empty burner ATAs back to owner's Recovery Pool
+ * Body: { owner: string }
+ */
+router.post('/recovery/sweep', async (req: Request, res: Response) => {
+  try {
+    const { owner } = req.body;
+    
+    if (!owner) {
+      return res.status(400).json({
+        success: false,
+        error: 'Owner wallet address required',
+      });
+    }
+    
+    const { getRecoveryPoolStatus, setRecoveryConnection } = await import('../solana/recovery.js');
+    const { getRegularConnection } = await import('../light/client.js');
+    
+    const conn = getRegularConnection();
+    setRecoveryConnection(conn);
     
     // Return status showing what would be swept
-    const status = await getRecoveryPoolStatus(conn);
+    const status = await getRecoveryPoolStatus(owner, conn);
     
     res.json({
       success: true,
@@ -5037,26 +5116,42 @@ router.post('/recovery/sweep', async (req: Request, res: Response) => {
 
 /**
  * GET /api/credits/recovery/validate
- * Validate Recovery Pool can fund a transaction
+ * Validate owner's Recovery Pool can fund a transaction
+ * Query params: owner (required)
  */
 router.get('/recovery/validate', async (req: Request, res: Response) => {
   try {
-    const { initRecoveryPool, validateRecoveryLiquidity } = await import('../solana/recovery.js');
+    const { owner } = req.query;
+    
+    if (!owner || typeof owner !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Owner wallet address required',
+      });
+    }
+    
+    const { validateRecoveryLiquidity, setRecoveryConnection } = await import('../solana/recovery.js');
     const { getRegularConnection } = await import('../light/client.js');
     
     const conn = getRegularConnection();
-    await initRecoveryPool(conn);
+    setRecoveryConnection(conn);
     
-    const validation = await validateRecoveryLiquidity(conn);
+    const validation = await validateRecoveryLiquidity(owner, conn);
     
     res.json({
       success: true,
       data: {
-        canExecutePayment: validation.valid,
+        initialized: validation.initialized,
+        isLocked: validation.isLocked,
+        canExecutePayment: validation.valid && !validation.isLocked,
         currentBalance: validation.balance,
         requiredBalance: validation.required,
         shortfall: validation.shortfall || 0,
-        message: validation.valid 
+        message: !validation.initialized
+          ? 'Recovery Pool not initialized. Create one first.'
+          : validation.isLocked
+          ? 'Recovery Pool is locked. Please re-authenticate.'
+          : validation.valid 
           ? 'Recovery Pool has sufficient liquidity'
           : `Recovery Pool needs ${validation.shortfall?.toFixed(4)} more SOL`,
       },

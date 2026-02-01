@@ -48,7 +48,9 @@ interface RecoveryPoolStatus {
   totalRecycledFormatted: string;
   minRequired: number;
   minRequiredFormatted: string;
-  status: 'NOT_INITIALIZED' | 'NEEDS_FUNDING' | 'HEALTHY';
+  status: 'NOT_INITIALIZED' | 'NEEDS_FUNDING' | 'HEALTHY' | 'LOCKED';
+  isLocked?: boolean;
+  poolId?: string;
   message?: string;
 }
 
@@ -59,7 +61,7 @@ interface RecoveryPoolPanelProps {
 }
 
 export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }: RecoveryPoolPanelProps) {
-  const { publicKey, connected, signTransaction } = useWallet();
+  const { publicKey, connected, signTransaction, signMessage } = useWallet();
   const { connection } = useConnection();
   const [status, setStatus] = useState<RecoveryPoolStatus | null>(null);
   const [loading, setLoading] = useState(false);
@@ -78,9 +80,9 @@ export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }:
     onLog?.(level, message);
   }, [onLog]);
 
-  // Fetch status from backend
+  // Fetch status from backend (per-user)
   const fetchStatus = useCallback(async (force = false) => {
-    if (loading) return;
+    if (loading || !publicKey) return;
     
     setLoading(true);
     setError(null);
@@ -90,7 +92,8 @@ export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }:
         clearCache('/api/credits/recovery/status');
       }
       
-      const response = await fetch(`${GATEWAY_URL}/api/credits/recovery/status`);
+      // Pass owner wallet address to get this user's Recovery Pool
+      const response = await fetch(`${GATEWAY_URL}/api/credits/recovery/status?owner=${publicKey.toBase58()}`);
       const result = await response.json();
       
       if (result.success && result.data) {
@@ -101,7 +104,7 @@ export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }:
     } finally {
       setLoading(false);
     }
-  }, [loading]);
+  }, [loading, publicKey]);
 
   // Load on mount
   useEffect(() => {
@@ -110,17 +113,33 @@ export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }:
     }
   }, [connected]);
 
-  // Initialize Recovery Pool (creates real wallet)
+  // Initialize Recovery Pool (creates real wallet for this user)
   const handleInitialize = useCallback(async () => {
+    if (!publicKey || !signMessage) {
+      setError('Wallet not connected');
+      return;
+    }
+    
     setInitializing(true);
     setError(null);
     
     try {
-      log('info', 'Creating Recovery Pool wallet...');
+      log('info', 'Creating your Recovery Pool wallet...');
+      
+      // Sign a message to prove wallet ownership
+      const timestamp = Date.now();
+      const message = `AEGIX_RECOVERY_POOL::${publicKey.toBase58()}::${timestamp}`;
+      const encodedMessage = new TextEncoder().encode(message);
+      const signatureBytes = await signMessage(encodedMessage);
+      const signature = Buffer.from(signatureBytes).toString('base64');
       
       const response = await fetch(`${GATEWAY_URL}/api/credits/recovery/initialize`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          owner: publicKey.toBase58(),
+          signature,
+        }),
       });
       
       const result = await response.json();
@@ -137,12 +156,14 @@ export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }:
         throw new Error(result.error || 'Failed to create Recovery Pool');
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to initialize');
-      log('error', `Initialization failed: ${err.message}`);
+      if (!err.message?.includes('rejected')) {
+        setError(err.message || 'Failed to initialize');
+        log('error', `Initialization failed: ${err.message}`);
+      }
     } finally {
       setInitializing(false);
     }
-  }, [log, fetchStatus, onRefresh]);
+  }, [publicKey, signMessage, log, fetchStatus, onRefresh]);
 
   // Copy address to clipboard
   const copyAddress = useCallback(() => {
@@ -155,11 +176,17 @@ export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }:
 
   // Sweep burner rent
   const handleSweep = useCallback(async () => {
+    if (!publicKey) return;
+    
     setSweeping(true);
     
     try {
       const response = await fetch(`${GATEWAY_URL}/api/credits/recovery/sweep`, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          owner: publicKey.toBase58(),
+        }),
       });
       const data = await response.json();
       
@@ -172,7 +199,7 @@ export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }:
     } finally {
       setSweeping(false);
     }
-  }, [log, fetchStatus]);
+  }, [publicKey, log, fetchStatus]);
 
   // Deposit SOL to Recovery Pool
   const handleDeposit = useCallback(async () => {
@@ -273,10 +300,10 @@ export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }:
             <div className="flex items-start gap-3 mb-4">
               <AlertCircle className="w-5 h-5 text-status-warning flex-shrink-0 mt-0.5" />
               <div>
-                <p className="text-sm text-slate-300 mb-1">Recovery Pool Required</p>
+                <p className="text-sm text-slate-300 mb-1">Your Recovery Pool Required</p>
                 <p className="text-[11px] text-slate-500">
-                  The Recovery Pool is a real Solana wallet that pays transaction fees and ATA rent 
-                  for privacy payments. This breaks the on-chain link between your pool and recipients.
+                  Create your personal Recovery Pool - a real Solana wallet that pays transaction fees and ATA rent 
+                  for your privacy payments. This breaks the on-chain link between your pool and recipients.
                 </p>
               </div>
             </div>
@@ -439,7 +466,7 @@ export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }:
 
           {/* Info */}
           <div className="mt-3 text-[9px] text-slate-500">
-            This wallet pays transaction fees and ATA rent for privacy payments, 
+            Your personal Recovery Pool pays transaction fees and ATA rent for your privacy payments, 
             breaking the on-chain link between your pool and recipients.
           </div>
         </div>

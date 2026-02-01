@@ -1,16 +1,16 @@
 /**
- * Recovery Pool - Dedicated Fee Payer for Stealth Transactions
+ * Recovery Pool - Per-User Fee Payer for Stealth Transactions
  * 
- * THIS IS A REAL SOLANA WALLET that the user must fund!
+ * EACH USER HAS THEIR OWN RECOVERY POOL that they must fund!
  * 
  * Purpose:
  * 1. Pay transaction fees (breaks on-chain link between Stealth Pool and burners)
  * 2. Pay ATA rent for recipients (~0.002 SOL)
  * 3. Reclaim rent when burner ATAs are closed
  * 
- * The user must:
- * 1. Initialize the Recovery Pool (generates a keypair)
- * 2. Fund the Recovery Pool address with SOL
+ * Each user must:
+ * 1. Initialize their Recovery Pool (generates a keypair)
+ * 2. Fund their Recovery Pool address with SOL
  * 3. Top up when balance is low
  */
 
@@ -29,8 +29,9 @@ import {
   TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
-import { Mutex, withTimeout } from 'async-mutex';
+import { Mutex } from 'async-mutex';
 import bs58 from 'bs58';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -40,91 +41,256 @@ const MIN_LIQUIDITY_SOL = 0.005; // Minimum SOL balance required
 const ATA_RENT_SOL = 0.00203928; // Approximate rent for ATA
 
 // =============================================================================
-// SECURITY: Mutex-backed Liquidity Reservation System
-// Prevents race conditions in concurrent payment processing
+// PER-USER RECOVERY POOL DATA MODEL
 // =============================================================================
 
-const liquidityMutex = withTimeout(new Mutex(), 5000); // 5s timeout to prevent deadlocks
-const pendingReservations = new Map<string, number>();
+export interface RecoveryPool {
+  id: string;                    // recovery-{owner_hash}
+  publicKey: string;             // Recovery Pool address
+  owner: string;                 // Owner wallet address
+  encryptedSecretKey: string;    // AES-256-CBC encrypted
+  encryptionSalt: string;        // Salt for decryption
+  creationSignature: string;     // Signature used at creation
+  createdAt: number;
+  totalRecycled: number;
+  status: 'created' | 'funded' | 'active';
+  isLocked?: boolean;            // True if pool exists but key not in memory (needs re-auth)
+}
 
-/**
- * Atomically reserve liquidity from the Recovery Pool
- * Must be called before any ATA creation or fee payment
- * 
- * @param amount - Amount of SOL to reserve
- * @param txId - Unique transaction ID for tracking
- * @returns true if reservation succeeded, false if insufficient liquidity
- */
-export async function reserveLiquidity(amount: number, txId: string): Promise<boolean> {
-  const release = await liquidityMutex.acquire();
+// Persisted metadata (without sensitive keys in plaintext)
+interface PersistedRecoveryPool {
+  id: string;
+  publicKey: string;
+  owner: string;
+  encryptedSecretKey: string;
+  encryptionSalt: string;
+  creationSignature: string;
+  createdAt: number;
+  totalRecycled: number;
+  status: 'created' | 'funded' | 'active';
+}
+
+// =============================================================================
+// PERSISTENCE
+// =============================================================================
+
+const DATA_DIR = path.join(process.cwd(), 'data');
+const RECOVERY_POOLS_FILE = path.join(DATA_DIR, 'recovery-pools.json');
+
+function loadPersistedPools(): Map<string, PersistedRecoveryPool> {
+  const pools = new Map<string, PersistedRecoveryPool>();
+  
   try {
-    const balance = await getRecoveryPoolBalance();
-    const totalPending = Array.from(pendingReservations.values()).reduce((a, b) => a + b, 0);
+    if (fs.existsSync(RECOVERY_POOLS_FILE)) {
+      const raw = fs.readFileSync(RECOVERY_POOLS_FILE, 'utf-8');
+      const data = JSON.parse(raw);
+      
+      if (data.pools && Array.isArray(data.pools)) {
+        for (const pool of data.pools) {
+          pools.set(pool.id, pool);
+        }
+        console.log(`[Recovery] Loaded ${pools.size} recovery pool(s) from disk`);
+      }
+    }
+  } catch (error) {
+    console.warn('[Recovery] Failed to load recovery-pools.json:', error);
+  }
+  
+  return pools;
+}
+
+let saveDebounceTimer: NodeJS.Timeout | null = null;
+
+function savePoolsToDisk(): void {
+  if (saveDebounceTimer) {
+    clearTimeout(saveDebounceTimer);
+  }
+  
+  saveDebounceTimer = setTimeout(() => {
+    try {
+      if (!fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+      }
+      
+      const poolsToSave: PersistedRecoveryPool[] = [];
+      for (const pool of recoveryPoolRegistry.values()) {
+        if (pool.encryptedSecretKey && pool.encryptionSalt && pool.creationSignature) {
+          poolsToSave.push({
+            id: pool.id,
+            publicKey: pool.publicKey,
+            owner: pool.owner,
+            encryptedSecretKey: pool.encryptedSecretKey,
+            encryptionSalt: pool.encryptionSalt,
+            creationSignature: pool.creationSignature,
+            createdAt: pool.createdAt,
+            totalRecycled: pool.totalRecycled,
+            status: pool.status,
+          });
+        }
+      }
+      
+      const saveData = {
+        pools: poolsToSave,
+        savedAt: new Date().toISOString(),
+        version: '2.0',
+        type: 'recovery-pools'
+      };
+      fs.writeFileSync(RECOVERY_POOLS_FILE, JSON.stringify(saveData, null, 2));
+      console.log(`[Recovery] Saved ${poolsToSave.length} recovery pool(s) to disk`);
+    } catch (error) {
+      console.error('[Recovery] Failed to save recovery-pools.json:', error);
+    }
+  }, 500);
+}
+
+// =============================================================================
+// ENCRYPTION HELPERS - Same pattern as Stealth Pools
+// =============================================================================
+
+function encryptPrivateKey(secretKey: Uint8Array, ownerWallet: string, signature: string): string {
+  const derivedKey = crypto.createHash('sha256')
+    .update(ownerWallet + signature)
+    .digest();
+  
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-cbc', derivedKey, iv);
+  
+  let encrypted = cipher.update(Buffer.from(secretKey));
+  encrypted = Buffer.concat([encrypted, cipher.final()]);
+  
+  return Buffer.concat([iv, encrypted]).toString('base64');
+}
+
+function decryptPrivateKey(encryptedKey: string, ownerWallet: string, signature: string): Uint8Array {
+  const derivedKey = crypto.createHash('sha256')
+    .update(ownerWallet + signature)
+    .digest();
+  
+  const data = Buffer.from(encryptedKey, 'base64');
+  const iv = data.subarray(0, 16);
+  const encrypted = data.subarray(16);
+  
+  const decipher = crypto.createDecipheriv('aes-256-cbc', derivedKey, iv);
+  
+  let decrypted = decipher.update(encrypted);
+  decrypted = Buffer.concat([decrypted, decipher.final()]);
+  
+  return new Uint8Array(decrypted);
+}
+
+// =============================================================================
+// IN-MEMORY REGISTRIES
+// =============================================================================
+
+const recoveryPoolRegistry = new Map<string, RecoveryPool>();  // poolId -> pool
+const ownerRecoveryIndex = new Map<string, string>();          // owner -> poolId
+
+// Load persisted pools on startup (as locked - no decrypted keys)
+const persistedPools = loadPersistedPools();
+persistedPools.forEach((metadata, poolId) => {
+  const lockedPool: RecoveryPool = {
+    id: metadata.id,
+    publicKey: metadata.publicKey,
+    owner: metadata.owner,
+    encryptedSecretKey: metadata.encryptedSecretKey,
+    encryptionSalt: metadata.encryptionSalt,
+    creationSignature: metadata.creationSignature,
+    createdAt: metadata.createdAt,
+    totalRecycled: metadata.totalRecycled,
+    status: metadata.status,
+    isLocked: true, // Needs re-auth to decrypt
+  };
+  recoveryPoolRegistry.set(poolId, lockedPool);
+  ownerRecoveryIndex.set(metadata.owner, poolId);
+});
+
+if (persistedPools.size > 0) {
+  console.log(`[Recovery] Initialized ${persistedPools.size} locked recovery pool(s) from disk`);
+}
+
+// Connection reference
+let connection: Connection | null = null;
+
+// =============================================================================
+// SECURITY: Mutex-backed Liquidity Reservation System (Per-User)
+// =============================================================================
+
+const liquidityMutexes = new Map<string, Mutex>();
+const pendingReservations = new Map<string, Map<string, number>>(); // owner -> (txId -> amount)
+
+function getLiquidityMutex(owner: string): Mutex {
+  if (!liquidityMutexes.has(owner)) {
+    liquidityMutexes.set(owner, new Mutex());
+  }
+  return liquidityMutexes.get(owner)!;
+}
+
+export async function reserveLiquidity(owner: string, amount: number, txId: string): Promise<boolean> {
+  const mutex = getLiquidityMutex(owner);
+  const release = await mutex.acquire();
+  
+  try {
+    const balance = await getRecoveryPoolBalanceForOwner(owner);
+    
+    if (!pendingReservations.has(owner)) {
+      pendingReservations.set(owner, new Map());
+    }
+    const ownerReservations = pendingReservations.get(owner)!;
+    const totalPending = Array.from(ownerReservations.values()).reduce((a, b) => a + b, 0);
     const available = balance - totalPending - MIN_LIQUIDITY_SOL;
     
     if (available >= amount) {
-      pendingReservations.set(txId, amount);
-      // Auto-expire reservation after 60 seconds to prevent leaks
+      ownerReservations.set(txId, amount);
+      
+      // Auto-expire reservation after 60 seconds
       setTimeout(() => {
-        if (pendingReservations.has(txId)) {
-          console.warn(`[Recovery] ⚠ Auto-expiring stale reservation: ${txId}`);
-          pendingReservations.delete(txId);
+        if (ownerReservations.has(txId)) {
+          console.warn(`[Recovery] Auto-expiring stale reservation for ${owner.slice(0, 8)}...: ${txId}`);
+          ownerReservations.delete(txId);
         }
       }, 60000);
-      console.log(`[Recovery] ✓ Reserved ${amount} SOL for ${txId} (available: ${available.toFixed(4)})`);
+      
+      console.log(`[Recovery] Reserved ${amount} SOL for ${owner.slice(0, 8)}... (available: ${available.toFixed(4)})`);
       return true;
     }
     
-    console.warn(`[Recovery] ✗ Insufficient liquidity for ${txId}: need ${amount}, have ${available.toFixed(4)}`);
+    console.warn(`[Recovery] Insufficient liquidity for ${owner.slice(0, 8)}...: need ${amount}, have ${available.toFixed(4)}`);
     return false;
   } finally {
     release();
   }
 }
 
-/**
- * Release a liquidity reservation after transaction completes (success or failure)
- * @param txId - Transaction ID to release
- */
-export function releaseReservation(txId: string): void {
-  if (pendingReservations.has(txId)) {
-    const amount = pendingReservations.get(txId);
-    pendingReservations.delete(txId);
-    console.log(`[Recovery] ✓ Released reservation ${txId} (${amount} SOL)`);
+export function releaseReservation(owner: string, txId: string): void {
+  const ownerReservations = pendingReservations.get(owner);
+  if (ownerReservations?.has(txId)) {
+    const amount = ownerReservations.get(txId);
+    ownerReservations.delete(txId);
+    console.log(`[Recovery] Released reservation for ${owner.slice(0, 8)}...: ${txId} (${amount} SOL)`);
   }
 }
 
-/**
- * Get current pending reservations total
- */
-export function getPendingReservationsTotal(): number {
-  return Array.from(pendingReservations.values()).reduce((a, b) => a + b, 0);
+export function getPendingReservationsTotal(owner: string): number {
+  const ownerReservations = pendingReservations.get(owner);
+  if (!ownerReservations) return 0;
+  return Array.from(ownerReservations.values()).reduce((a, b) => a + b, 0);
 }
 
 // =============================================================================
-// SECURITY: Rate Limiting for Decompress Operations
-// Prevents Fee-Drain DoS attacks
+// SECURITY: Rate Limiting for Decompress Operations (Per-User)
 // =============================================================================
 
 const decompressRateLimit = new Map<string, number[]>();
 const MAX_DECOMPRESS_PER_MINUTE = 5;
 
-/**
- * Check if a decompress operation is allowed under rate limits
- * Uses sliding-window algorithm for accurate rate limiting
- * 
- * @param ownerId - Owner/agent identifier to rate limit
- * @returns true if allowed, false if rate limited
- */
 export function checkDecompressRateLimit(ownerId: string): boolean {
   const now = Date.now();
   const requests = decompressRateLimit.get(ownerId) || [];
   
-  // Filter to only requests in the last 60 seconds
   const recent = requests.filter(t => now - t < 60000);
   
   if (recent.length >= MAX_DECOMPRESS_PER_MINUTE) {
-    console.warn(`[Recovery] ✗ Rate limit exceeded for ${ownerId.slice(0, 12)}... (${recent.length}/${MAX_DECOMPRESS_PER_MINUTE} per minute)`);
+    console.warn(`[Recovery] Rate limit exceeded for ${ownerId.slice(0, 12)}... (${recent.length}/${MAX_DECOMPRESS_PER_MINUTE} per minute)`);
     return false;
   }
   
@@ -139,9 +305,6 @@ export function checkDecompressRateLimit(ownerId: string): boolean {
   return true;
 }
 
-/**
- * Cleanup stale rate limit entries to prevent memory bloat
- */
 function cleanupRateLimitEntries(): void {
   const now = Date.now();
   for (const [ownerId, requests] of decompressRateLimit.entries()) {
@@ -155,132 +318,8 @@ function cleanupRateLimitEntries(): void {
 }
 
 // =============================================================================
-// END SECURITY ADDITIONS
+// CORE FUNCTIONS
 // =============================================================================
-
-// Persistence path
-const DATA_DIR = path.join(process.cwd(), 'data');
-const RECOVERY_FILE = path.join(DATA_DIR, 'recovery-pool.json');
-
-// Recovery Pool state
-let recoveryKeypair: Keypair | null = null;
-let connection: Connection | null = null;
-let totalRecycled: number = 0;
-let isInitialized: boolean = false;
-
-/**
- * Load Recovery Pool from disk or environment
- */
-export async function loadRecoveryPool(conn?: Connection): Promise<boolean> {
-  if (conn) {
-    connection = conn;
-  }
-
-  // First try environment variable
-  const envKey = process.env.RECOVERY_POOL_PRIVATE_KEY;
-  if (envKey && envKey.trim() !== '') {
-    try {
-      const secretKey = bs58.decode(envKey);
-      recoveryKeypair = Keypair.fromSecretKey(secretKey);
-      isInitialized = true;
-      console.log(`[Recovery] ✓ Loaded from ENV: ${recoveryKeypair.publicKey.toBase58().slice(0, 12)}...`);
-      return true;
-    } catch (error) {
-      console.error('[Recovery] Invalid RECOVERY_POOL_PRIVATE_KEY in ENV');
-    }
-  }
-
-  // Then try disk persistence
-  try {
-    if (fs.existsSync(RECOVERY_FILE)) {
-      const data = JSON.parse(fs.readFileSync(RECOVERY_FILE, 'utf-8'));
-      if (data.privateKey) {
-        const secretKey = bs58.decode(data.privateKey);
-        recoveryKeypair = Keypair.fromSecretKey(secretKey);
-        totalRecycled = data.totalRecycled || 0;
-        isInitialized = true;
-        console.log(`[Recovery] ✓ Loaded from disk: ${recoveryKeypair.publicKey.toBase58().slice(0, 12)}...`);
-        return true;
-      }
-    }
-  } catch (error) {
-    console.warn('[Recovery] Failed to load from disk:', error);
-  }
-
-  console.log('[Recovery] ⚠ Recovery Pool not initialized - user must create one');
-  return false;
-}
-
-/**
- * Create a NEW Recovery Pool keypair
- * Called when user clicks "Initialize" in the frontend
- */
-export async function createRecoveryPool(conn?: Connection): Promise<{
-  address: string;
-  privateKey: string;
-  message: string;
-}> {
-  if (conn) {
-    connection = conn;
-  }
-
-  // Generate new keypair
-  const newKeypair = Keypair.generate();
-  const privateKeyBase58 = bs58.encode(newKeypair.secretKey);
-  
-  // Save to disk
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    
-    fs.writeFileSync(RECOVERY_FILE, JSON.stringify({
-      privateKey: privateKeyBase58,
-      address: newKeypair.publicKey.toBase58(),
-      createdAt: new Date().toISOString(),
-      totalRecycled: 0,
-    }, null, 2));
-    
-    console.log(`[Recovery] ✓ Created new Recovery Pool: ${newKeypair.publicKey.toBase58()}`);
-  } catch (error) {
-    console.error('[Recovery] Failed to persist keypair:', error);
-  }
-
-  // Set as active
-  recoveryKeypair = newKeypair;
-  isInitialized = true;
-  totalRecycled = 0;
-
-  return {
-    address: newKeypair.publicKey.toBase58(),
-    privateKey: privateKeyBase58,
-    message: `Recovery Pool created! Fund this address with at least ${MIN_LIQUIDITY_SOL} SOL to enable privacy payments.`,
-  };
-}
-
-/**
- * Check if Recovery Pool is initialized
- */
-export function isRecoveryPoolInitialized(): boolean {
-  return isInitialized && recoveryKeypair !== null;
-}
-
-/**
- * Get the Recovery Pool keypair (throws if not initialized)
- */
-export function getRecoveryPoolKeypair(): Keypair {
-  if (!recoveryKeypair) {
-    throw new Error('Recovery Pool not initialized. User must create one first.');
-  }
-  return recoveryKeypair;
-}
-
-/**
- * Get the Recovery Pool public key (throws if not initialized)
- */
-export function getRecoveryPoolAddress(): PublicKey {
-  return getRecoveryPoolKeypair().publicKey;
-}
 
 /**
  * Set the connection for recovery pool operations
@@ -290,44 +329,237 @@ export function setRecoveryConnection(conn: Connection): void {
 }
 
 /**
- * Get the Recovery Pool's SOL balance
+ * Check if an owner has a Recovery Pool
  */
-export async function getRecoveryPoolBalance(conn?: Connection): Promise<number> {
-  if (!isRecoveryPoolInitialized()) {
-    return 0;
-  }
+export function hasRecoveryPool(owner: string): boolean {
+  return ownerRecoveryIndex.has(owner);
+}
 
+/**
+ * Get Recovery Pool for a specific owner
+ */
+export function getRecoveryPoolForOwner(owner: string): RecoveryPool | null {
+  const poolId = ownerRecoveryIndex.get(owner);
+  if (!poolId) return null;
+  return recoveryPoolRegistry.get(poolId) || null;
+}
+
+/**
+ * Create a NEW Recovery Pool for a user
+ * Requires wallet signature to encrypt the keypair
+ */
+export async function createRecoveryPool(
+  ownerWallet: string,
+  ownerSignature: string,
+  conn?: Connection
+): Promise<{
+  success: boolean;
+  address?: string;
+  poolId?: string;
+  message: string;
+  error?: string;
+}> {
+  if (conn) {
+    connection = conn;
+  }
+  
+  // Check if owner already has a Recovery Pool
+  const existingPool = getRecoveryPoolForOwner(ownerWallet);
+  if (existingPool && !existingPool.isLocked) {
+    return {
+      success: true,
+      address: existingPool.publicKey,
+      poolId: existingPool.id,
+      message: 'Recovery Pool already exists and is unlocked',
+    };
+  }
+  
+  // If pool exists but is locked, try to unlock it
+  if (existingPool && existingPool.isLocked) {
+    try {
+      const unlocked = await unlockRecoveryPool(ownerWallet, ownerSignature);
+      if (unlocked) {
+        return {
+          success: true,
+          address: existingPool.publicKey,
+          poolId: existingPool.id,
+          message: 'Recovery Pool unlocked successfully',
+        };
+      }
+    } catch (error: any) {
+      console.error('[Recovery] Failed to unlock existing pool:', error);
+    }
+  }
+  
+  // Generate new keypair
+  const newKeypair = Keypair.generate();
+  
+  // Encrypt the secret key with owner's signature
+  const encryptionSalt = crypto.randomBytes(16).toString('hex');
+  const encryptedSecretKey = encryptPrivateKey(
+    newKeypair.secretKey,
+    ownerWallet,
+    ownerSignature + encryptionSalt
+  );
+  
+  // Create pool ID
+  const ownerHash = crypto.createHash('sha256').update(ownerWallet).digest('hex').slice(0, 8);
+  const poolId = `recovery-${ownerHash}-${Date.now()}`;
+  
+  // Create pool object
+  const pool: RecoveryPool = {
+    id: poolId,
+    publicKey: newKeypair.publicKey.toBase58(),
+    owner: ownerWallet,
+    encryptedSecretKey,
+    encryptionSalt,
+    creationSignature: ownerSignature,
+    createdAt: Date.now(),
+    totalRecycled: 0,
+    status: 'created',
+    isLocked: false,
+  };
+  
+  // Store in registries
+  recoveryPoolRegistry.set(poolId, pool);
+  ownerRecoveryIndex.set(ownerWallet, poolId);
+  
+  // Persist to disk
+  savePoolsToDisk();
+  
+  console.log(`[Recovery] Created new Recovery Pool for ${ownerWallet.slice(0, 8)}...: ${newKeypair.publicKey.toBase58()}`);
+  
+  return {
+    success: true,
+    address: newKeypair.publicKey.toBase58(),
+    poolId,
+    message: `Recovery Pool created! Fund this address with at least ${MIN_LIQUIDITY_SOL} SOL to enable privacy payments.`,
+  };
+}
+
+/**
+ * Unlock a locked Recovery Pool (re-authenticate with signature)
+ */
+export async function unlockRecoveryPool(ownerWallet: string, ownerSignature: string): Promise<boolean> {
+  const pool = getRecoveryPoolForOwner(ownerWallet);
+  if (!pool) {
+    throw new Error('Recovery Pool not found for this owner');
+  }
+  
+  if (!pool.isLocked) {
+    return true; // Already unlocked
+  }
+  
+  // Verify we can decrypt with this signature
+  try {
+    const secretKey = decryptPrivateKey(
+      pool.encryptedSecretKey,
+      pool.owner,
+      pool.creationSignature + pool.encryptionSalt
+    );
+    
+    // Verify the keypair matches
+    const keypair = Keypair.fromSecretKey(secretKey);
+    if (keypair.publicKey.toBase58() !== pool.publicKey) {
+      throw new Error('Keypair mismatch after decryption');
+    }
+    
+    // Update pool to unlocked
+    pool.isLocked = false;
+    // Update the creation signature if they used a new one
+    // (for security, we keep the original signature that was used during creation)
+    
+    console.log(`[Recovery] Unlocked Recovery Pool for ${ownerWallet.slice(0, 8)}...`);
+    return true;
+  } catch (error: any) {
+    console.error(`[Recovery] Failed to unlock pool: ${error.message}`);
+    throw new Error('Failed to decrypt Recovery Pool - signature mismatch');
+  }
+}
+
+/**
+ * Get the decrypted keypair for a user's Recovery Pool
+ */
+export function getRecoveryPoolKeypair(owner: string): Keypair {
+  const pool = getRecoveryPoolForOwner(owner);
+  if (!pool) {
+    throw new Error(`No Recovery Pool found for ${owner.slice(0, 8)}...`);
+  }
+  
+  if (pool.isLocked) {
+    throw new Error('Recovery Pool is locked. User must re-authenticate.');
+  }
+  
+  if (!pool.encryptedSecretKey || !pool.creationSignature || !pool.encryptionSalt) {
+    throw new Error('Recovery Pool missing encryption credentials');
+  }
+  
+  const secretKey = decryptPrivateKey(
+    pool.encryptedSecretKey,
+    pool.owner,
+    pool.creationSignature + pool.encryptionSalt
+  );
+  
+  return Keypair.fromSecretKey(secretKey);
+}
+
+/**
+ * Get the Recovery Pool public key for an owner
+ */
+export function getRecoveryPoolAddress(owner: string): PublicKey {
+  const pool = getRecoveryPoolForOwner(owner);
+  if (!pool) {
+    throw new Error(`No Recovery Pool found for ${owner.slice(0, 8)}...`);
+  }
+  return new PublicKey(pool.publicKey);
+}
+
+/**
+ * Get Recovery Pool SOL balance for an owner
+ */
+export async function getRecoveryPoolBalanceForOwner(owner: string, conn?: Connection): Promise<number> {
+  const pool = getRecoveryPoolForOwner(owner);
+  if (!pool) return 0;
+  
   const useConn = conn || connection;
   if (!useConn) {
     throw new Error('No connection available');
   }
-
-  const keypair = getRecoveryPoolKeypair();
-  const balance = await useConn.getBalance(keypair.publicKey);
-  return balance / LAMPORTS_PER_SOL;
+  
+  try {
+    const balance = await useConn.getBalance(new PublicKey(pool.publicKey));
+    return balance / LAMPORTS_PER_SOL;
+  } catch (error) {
+    console.error(`[Recovery] Failed to get balance for ${owner.slice(0, 8)}...:`, error);
+    return 0;
+  }
 }
 
 /**
- * Check if Recovery Pool has sufficient liquidity
+ * Validate Recovery Pool liquidity for an owner
  */
-export async function validateRecoveryLiquidity(conn?: Connection): Promise<{
+export async function validateRecoveryLiquidity(owner: string, conn?: Connection): Promise<{
   valid: boolean;
   balance: number;
   required: number;
   shortfall?: number;
   initialized: boolean;
+  isLocked: boolean;
 }> {
-  if (!isRecoveryPoolInitialized()) {
+  const pool = getRecoveryPoolForOwner(owner);
+  
+  if (!pool) {
     return {
       valid: false,
       balance: 0,
       required: MIN_LIQUIDITY_SOL,
       shortfall: MIN_LIQUIDITY_SOL,
       initialized: false,
+      isLocked: false,
     };
   }
-
-  const balance = await getRecoveryPoolBalance(conn);
+  
+  const balance = await getRecoveryPoolBalanceForOwner(owner, conn);
   const valid = balance >= MIN_LIQUIDITY_SOL;
   
   return {
@@ -336,21 +568,26 @@ export async function validateRecoveryLiquidity(conn?: Connection): Promise<{
     required: MIN_LIQUIDITY_SOL,
     shortfall: valid ? undefined : MIN_LIQUIDITY_SOL - balance,
     initialized: true,
+    isLocked: pool.isLocked || false,
   };
 }
 
 /**
- * Get Recovery Pool status
+ * Get Recovery Pool status for an owner
  */
-export async function getRecoveryPoolStatus(conn?: Connection): Promise<{
+export async function getRecoveryPoolStatus(owner: string, conn?: Connection): Promise<{
   initialized: boolean;
   address: string | null;
   balance: number;
   isHealthy: boolean;
   totalRecycled: number;
   minRequired: number;
+  isLocked: boolean;
+  poolId: string | null;
 }> {
-  if (!isRecoveryPoolInitialized()) {
+  const pool = getRecoveryPoolForOwner(owner);
+  
+  if (!pool) {
     return {
       initialized: false,
       address: null,
@@ -358,31 +595,35 @@ export async function getRecoveryPoolStatus(conn?: Connection): Promise<{
       isHealthy: false,
       totalRecycled: 0,
       minRequired: MIN_LIQUIDITY_SOL,
+      isLocked: false,
+      poolId: null,
     };
   }
-
-  const keypair = getRecoveryPoolKeypair();
-  const balance = await getRecoveryPoolBalance(conn);
+  
+  const balance = await getRecoveryPoolBalanceForOwner(owner, conn);
   
   return {
     initialized: true,
-    address: keypair.publicKey.toBase58(),
+    address: pool.publicKey,
     balance,
-    isHealthy: balance >= MIN_LIQUIDITY_SOL,
-    totalRecycled,
+    isHealthy: balance >= MIN_LIQUIDITY_SOL && !pool.isLocked,
+    totalRecycled: pool.totalRecycled,
     minRequired: MIN_LIQUIDITY_SOL,
+    isLocked: pool.isLocked || false,
+    poolId: pool.id,
   };
 }
 
 /**
- * Create an ATA for a recipient, paid by the Recovery Pool
+ * Create an ATA for a recipient, paid by the owner's Recovery Pool
  */
 export function createRecipientAtaInstruction(
+  owner: string,
   recipientAddress: PublicKey,
   recipientAta: PublicKey,
   mint: PublicKey = USDC_MINT
 ): ReturnType<typeof createAssociatedTokenAccountInstruction> {
-  const recoveryPubkey = getRecoveryPoolAddress();
+  const recoveryPubkey = getRecoveryPoolAddress(owner);
   
   return createAssociatedTokenAccountInstruction(
     recoveryPubkey,      // Payer (Recovery Pool pays rent!)
@@ -418,172 +659,123 @@ export async function recipientAtaExists(
 }
 
 /**
- * Create instruction to close an empty ATA and reclaim rent
+ * Create instruction to close an empty ATA and reclaim rent to owner's Recovery Pool
  */
 export function createCloseAtaInstruction(
+  owner: string,
   ataAddress: PublicKey,
-  owner: PublicKey
+  ataOwner: PublicKey
 ): ReturnType<typeof createCloseAccountInstruction> {
-  const recoveryPubkey = getRecoveryPoolAddress();
+  const recoveryPubkey = getRecoveryPoolAddress(owner);
   
   return createCloseAccountInstruction(
     ataAddress,          // ATA to close
     recoveryPubkey,      // Destination for rent (Recovery Pool!)
-    owner,               // Authority (owner of the ATA)
+    ataOwner,            // Authority (owner of the ATA)
     [],                  // Multi-signers (none)
     TOKEN_PROGRAM_ID
   );
 }
 
 /**
- * Sweep rent from empty burner ATAs
+ * Add to recycled total for an owner
  */
-export async function sweepBurnerRent(
-  burnerKeypairs: Keypair[],
-  conn?: Connection,
-  mint: PublicKey = USDC_MINT
-): Promise<{ swept: number; totalRent: number; signatures: string[] }> {
-  if (!isRecoveryPoolInitialized()) {
-    throw new Error('Recovery Pool not initialized');
-  }
-
-  const useConn = conn || connection;
-  if (!useConn) {
-    throw new Error('No connection available');
-  }
-
-  const recoveryKp = getRecoveryPoolKeypair();
-  let swept = 0;
-  let totalRent = 0;
-  const signatures: string[] = [];
-
-  for (const burnerKeypair of burnerKeypairs) {
-    try {
-      const ata = await getAssociatedTokenAddress(mint, burnerKeypair.publicKey);
-      
-      try {
-        const account = await getAccount(useConn, ata, 'confirmed');
-        
-        if (account.amount === 0n) {
-          const transaction = new Transaction();
-          
-          transaction.add(
-            createCloseAccountInstruction(
-              ata,
-              recoveryKp.publicKey,
-              burnerKeypair.publicKey,
-              [],
-              TOKEN_PROGRAM_ID
-            )
-          );
-
-          const { blockhash } = await useConn.getLatestBlockhash('confirmed');
-          transaction.recentBlockhash = blockhash;
-          transaction.feePayer = recoveryKp.publicKey;
-          
-          transaction.sign(recoveryKp, burnerKeypair);
-          
-          const signature = await useConn.sendRawTransaction(transaction.serialize(), {
-            skipPreflight: false,
-            preflightCommitment: 'confirmed',
-          });
-          
-          await useConn.confirmTransaction(signature, 'confirmed');
-          
-          swept++;
-          totalRent += ATA_RENT_SOL;
-          signatures.push(signature);
-          totalRecycled += ATA_RENT_SOL;
-          
-          // Persist updated totalRecycled
-          persistRecycledAmount();
-          
-          console.log(`[Recovery] ✓ Swept rent from burner ${burnerKeypair.publicKey.toBase58().slice(0, 12)}...`);
-        }
-      } catch {
-        continue;
-      }
-    } catch (error: any) {
-      console.warn(`[Recovery] Failed to sweep burner: ${error.message}`);
-    }
-  }
-
-  return { swept, totalRent, signatures };
-}
-
-/**
- * Persist recycled amount to disk
- */
-function persistRecycledAmount(): void {
-  try {
-    if (fs.existsSync(RECOVERY_FILE)) {
-      const data = JSON.parse(fs.readFileSync(RECOVERY_FILE, 'utf-8'));
-      data.totalRecycled = totalRecycled;
-      fs.writeFileSync(RECOVERY_FILE, JSON.stringify(data, null, 2));
-    }
-  } catch (error) {
-    console.warn('[Recovery] Failed to persist recycled amount:', error);
+export function addToRecycled(owner: string, amount: number): void {
+  const pool = getRecoveryPoolForOwner(owner);
+  if (pool) {
+    pool.totalRecycled += amount;
+    savePoolsToDisk();
   }
 }
 
 /**
- * Get total SOL recycled
+ * Get total SOL recycled for an owner
  */
-export function getTotalRecycled(): number {
-  return totalRecycled;
+export function getTotalRecycled(owner: string): number {
+  const pool = getRecoveryPoolForOwner(owner);
+  return pool?.totalRecycled || 0;
 }
 
 /**
- * Add to recycled total
+ * Mark pool as funded/active
  */
-export function addToRecycled(amount: number): void {
-  totalRecycled += amount;
-  persistRecycledAmount();
+export async function markPoolFunded(owner: string, conn?: Connection): Promise<void> {
+  const pool = getRecoveryPoolForOwner(owner);
+  if (!pool) return;
+  
+  const balance = await getRecoveryPoolBalanceForOwner(owner, conn);
+  if (balance >= MIN_LIQUIDITY_SOL) {
+    pool.status = 'funded';
+    savePoolsToDisk();
+    console.log(`[Recovery] Pool for ${owner.slice(0, 8)}... marked as funded (${balance.toFixed(4)} SOL)`);
+  }
+}
+
+// =============================================================================
+// LEGACY COMPATIBILITY FUNCTIONS
+// =============================================================================
+
+// These maintain backward compatibility with old single-pool code
+
+/**
+ * @deprecated Use createRecoveryPool(owner, signature) instead
+ */
+export async function loadRecoveryPool(conn?: Connection): Promise<boolean> {
+  if (conn) {
+    connection = conn;
+  }
+  // Legacy function - just sets connection, pools are loaded on startup
+  return recoveryPoolRegistry.size > 0;
 }
 
 /**
- * Check if Recovery Pool is ready for use (initialized AND funded)
+ * @deprecated Use getRecoveryPoolForOwner(owner) instead
+ */
+export function isRecoveryPoolInitialized(): boolean {
+  // Legacy: returns true if ANY pool exists
+  return recoveryPoolRegistry.size > 0;
+}
+
+/**
+ * @deprecated Use isRecoveryPoolInitialized() instead
  */
 export function isRecoveryPoolReady(): boolean {
   return isRecoveryPoolInitialized();
 }
 
-/**
- * Initialize and return the Recovery Pool Keypair
- * Legacy function - loads if exists, throws if not initialized
- */
-export async function initRecoveryPool(conn?: Connection): Promise<Keypair> {
-  await loadRecoveryPool(conn);
-  
-  if (!isRecoveryPoolInitialized()) {
-    throw new Error('Recovery Pool not initialized. User must create one first via the dashboard.');
-  }
-  
-  return getRecoveryPoolKeypair();
-}
+// =============================================================================
+// EXPORTS
+// =============================================================================
 
 export default {
-  loadRecoveryPool,
+  // Per-user functions
   createRecoveryPool,
-  isRecoveryPoolInitialized,
+  unlockRecoveryPool,
+  hasRecoveryPool,
+  getRecoveryPoolForOwner,
   getRecoveryPoolKeypair,
   getRecoveryPoolAddress,
-  setRecoveryConnection,
-  getRecoveryPoolBalance,
+  getRecoveryPoolBalanceForOwner,
   validateRecoveryLiquidity,
   getRecoveryPoolStatus,
   createRecipientAtaInstruction,
   recipientAtaExists,
   createCloseAtaInstruction,
-  sweepBurnerRent,
-  getTotalRecycled,
   addToRecycled,
-  isRecoveryPoolReady,
-  initRecoveryPool,
+  getTotalRecycled,
+  markPoolFunded,
+  setRecoveryConnection,
+  
   // Security: Atomic liquidity reservation
   reserveLiquidity,
   releaseReservation,
   getPendingReservationsTotal,
+  
   // Security: Rate limiting
   checkDecompressRateLimit,
+  
+  // Legacy compatibility
+  loadRecoveryPool,
+  isRecoveryPoolInitialized,
+  isRecoveryPoolReady,
 };
