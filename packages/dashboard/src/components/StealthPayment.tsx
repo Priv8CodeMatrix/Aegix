@@ -535,35 +535,73 @@ export default function StealthPayment({
 
   // Execute payment - COMPRESSION ONLY (Aegix 4.0)
   // Show payment confirmation modal
-  const initiatePayment = () => {
+  // Initiate payment - refresh balance first to ensure we have latest data
+  const initiatePayment = async () => {
     if (!publicKey || !pool || !inputRecipient || parseFloat(inputAmount) <= 0) return;
     
-    // Check if pool has compressed/shielded funds available
-    const compressedUsdc = (pool.balance as any)?.compressedUsdc || 0;
-    const regularUsdc = pool.balance?.usdc || 0;
-    const paymentAmount = parseFloat(inputAmount);
-    const hasEnoughShielded = compressedUsdc >= paymentAmount;
-    const hasEnoughRegular = regularUsdc >= paymentAmount;
-    const hasSomeShielded = compressedUsdc > 0;
-    
-    console.log('[Payment] Checking balances:', { compressedUsdc, regularUsdc, paymentAmount, hasEnoughShielded, hasEnoughRegular });
-    
-    // If user has SOME shielded funds but NOT ENOUGH for this payment, prompt to shield more
-    if (hasSomeShielded && !hasEnoughShielded && hasEnoughRegular) {
-      const shortfall = paymentAmount - compressedUsdc;
-      setShieldingInfo({
-        regularUsdc,
-        compressedUsdc,
-        required: paymentAmount,
-      });
-      setNeedsShielding(true);
-      setError(`Payment requires ${paymentAmount.toFixed(2)} USDC but you only have ${compressedUsdc.toFixed(2)} shielded. Shield ${shortfall.toFixed(2)} more USDC or use Standard payment.`);
-      return;
+    // CRITICAL: Refresh balance BEFORE checking - ensures we have latest compressed balance
+    console.log('[Payment] Refreshing balance before payment check...');
+    try {
+      const response = await fetch(`${GATEWAY_URL}/api/credits/pool/${publicKey.toBase58()}`);
+      const result = await response.json();
+      if (result.success && result.data.balance) {
+        const freshBalance = result.data.balance;
+        console.log('[Payment] Fresh balance:', freshBalance);
+        
+        // Update pool state with fresh balance
+        setPool(prev => prev ? { ...prev, balance: freshBalance } : null);
+        
+        // Use fresh balance for checks
+        const compressedUsdc = freshBalance.compressedUsdc || 0;
+        const regularUsdc = freshBalance.usdc || 0;
+        const paymentAmount = parseFloat(inputAmount);
+        const hasEnoughShielded = compressedUsdc >= paymentAmount;
+        const hasEnoughRegular = regularUsdc >= paymentAmount;
+        const hasSomeShielded = compressedUsdc > 0;
+        
+        console.log('[Payment] Checking balances:', { 
+          compressedUsdc, 
+          regularUsdc, 
+          paymentAmount, 
+          hasEnoughShielded, 
+          hasEnoughRegular,
+          hasSomeShielded 
+        });
+        
+        // If user has SOME shielded funds but NOT ENOUGH for this payment, prompt to shield more
+        if (hasSomeShielded && !hasEnoughShielded && hasEnoughRegular) {
+          const shortfall = paymentAmount - compressedUsdc;
+          setShieldingInfo({
+            regularUsdc,
+            compressedUsdc,
+            required: paymentAmount,
+          });
+          setNeedsShielding(true);
+          setError(`Payment requires ${paymentAmount.toFixed(2)} USDC but you only have ${compressedUsdc.toFixed(2)} shielded. Shield ${shortfall.toFixed(2)} more USDC or use Standard payment.`);
+          return;
+        }
+        
+        // Set payment mode based on fresh balance
+        setHasCompressedFunds(hasEnoughShielded);
+        setUsePrivacyHardened(hasEnoughShielded); // Default to Maximum Privacy if shielded funds available
+        
+        console.log('[Payment] usePrivacyHardened set to:', hasEnoughShielded);
+        
+        setShowPaymentConfirmModal(true);
+      } else {
+        throw new Error('Failed to refresh balance');
+      }
+    } catch (err: any) {
+      console.error('[Payment] Balance refresh failed:', err);
+      // Fall back to existing pool data
+      const compressedUsdc = (pool.balance as any)?.compressedUsdc || 0;
+      const paymentAmount = parseFloat(inputAmount);
+      const hasEnoughShielded = compressedUsdc >= paymentAmount;
+      
+      setHasCompressedFunds(hasEnoughShielded);
+      setUsePrivacyHardened(hasEnoughShielded);
+      setShowPaymentConfirmModal(true);
     }
-    
-    setHasCompressedFunds(hasEnoughShielded);
-    setUsePrivacyHardened(hasEnoughShielded); // Default to Maximum Privacy if shielded funds available
-    setShowPaymentConfirmModal(true);
   };
 
   // Execute payment after confirmation
@@ -574,19 +612,27 @@ export default function StealthPayment({
     setError(null);
     setStep('paying');
     
-    // Aegix 4.0: Dual-mode - compressed (privacy) or standard (always works)
-    console.log(`[Payment] Executing ${usePrivacyHardened ? 'COMPRESSED PRIVATE' : 'STANDARD'} payment`);
+    // CRITICAL: Log exactly what we're sending
+    const paymentRequest = {
+      owner: publicKey.toBase58(),
+      recipient: inputRecipient,
+      amountUSDC: parseFloat(inputAmount),
+      useCompressed: usePrivacyHardened,
+    };
+    
+    console.log(`[Payment] ════════════════════════════════════════════════════════`);
+    console.log(`[Payment] SENDING PAYMENT REQUEST:`);
+    console.log(`[Payment]   Mode: ${usePrivacyHardened ? '🔒 COMPRESSED PRIVATE' : '📤 STANDARD'}`);
+    console.log(`[Payment]   Amount: ${paymentRequest.amountUSDC} USDC`);
+    console.log(`[Payment]   useCompressed: ${paymentRequest.useCompressed}`);
+    console.log(`[Payment]   Recipient: ${paymentRequest.recipient.slice(0, 12)}...`);
+    console.log(`[Payment] ════════════════════════════════════════════════════════`);
     
     try {
       const response = await fetch(`${GATEWAY_URL}/api/credits/pool/pay`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          owner: publicKey.toBase58(),
-          recipient: inputRecipient,
-          amountUSDC: parseFloat(inputAmount),
-          useCompressed: usePrivacyHardened,
-        }),
+        body: JSON.stringify(paymentRequest),
       });
       
       const result = await response.json();

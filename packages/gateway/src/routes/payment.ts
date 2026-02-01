@@ -2800,6 +2800,17 @@ router.post('/pool/pay', async (req: Request, res: Response) => {
   try {
     const { owner, recipient, amountUSDC, useCompressed = false } = req.body;
     
+    // CRITICAL: Log exactly what we received
+    console.log(`[Pool] ════════════════════════════════════════════════════════`);
+    console.log(`[Pool] PAYMENT REQUEST RECEIVED:`);
+    console.log(`[Pool]   Owner: ${owner?.slice(0, 12)}...`);
+    console.log(`[Pool]   Recipient: ${recipient?.slice(0, 12)}...`);
+    console.log(`[Pool]   Amount: ${amountUSDC} USDC`);
+    console.log(`[Pool]   useCompressed (from body): ${req.body.useCompressed}`);
+    console.log(`[Pool]   useCompressed (with default): ${useCompressed}`);
+    console.log(`[Pool]   Mode: ${useCompressed ? '🔒 COMPRESSED' : '📤 STANDARD'}`);
+    console.log(`[Pool] ════════════════════════════════════════════════════════`);
+    
     if (!owner || !recipient || !amountUSDC) {
       return res.status(400).json({
         success: false,
