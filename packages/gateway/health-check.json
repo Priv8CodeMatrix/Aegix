@@ -1,0 +1,7 @@
+{
+  "status": "healthy",
+  "service": "aegix-gateway",
+  "version": "1.1.0",
+  "network": "mainnet-beta",
+  "timestamp": 1768422007110
+}

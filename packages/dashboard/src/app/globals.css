@@ -1,0 +1,335 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Institutional Grayscale Palette - Slate System */
+  --slate-950: #020617;
+  --slate-900: #0f172a;
+  --slate-800: #1e293b;
+  --slate-700: #334155;
+  --slate-600: #475569;
+  --slate-500: #64748b;
+  --slate-400: #94a3b8;
+  --slate-300: #cbd5e1;
+  --slate-200: #e2e8f0;
+  --slate-100: #f1f5f9;
+  --slate-50:  #f8fafc;
+  
+  /* Functional Backgrounds */
+  --bg-base:      var(--slate-950);
+  --bg-surface:   var(--slate-900);
+  --bg-elevated:  var(--slate-800);
+  --bg-muted:     var(--slate-700);
+  
+  /* Borders */
+  --border-subtle:  rgba(51, 65, 85, 0.5);
+  --border-default: var(--slate-700);
+  --border-strong:  var(--slate-600);
+  
+  /* Text Hierarchy */
+  --text-primary:   var(--slate-100);
+  --text-secondary: var(--slate-400);
+  --text-muted:     var(--slate-500);
+  --text-subtle:    var(--slate-600);
+  
+  /* Semantic Status Indicators */
+  --status-success:  #10b981;
+  --status-warning:  #f59e0b;
+  --status-critical: #ef4444;
+  --status-info:     #3b82f6;
+  --status-neutral:  var(--slate-500);
+  
+  /* FHE/Protocol Specific */
+  --fhe-encrypted:   var(--slate-500);
+  --fhe-decrypted:   var(--status-success);
+  --protocol-active: var(--status-success);
+  --protocol-stale:  var(--status-warning);
+  --protocol-error:  var(--status-critical);
+  
+  /* Grid System */
+  --header-height: 48px;
+  --sidebar-width: 240px;
+  --console-height: 180px;
+  
+  /* Ambient Background Gradients */
+  --gradient-ambient-base: linear-gradient(to bottom, #020617 0%, rgba(15, 23, 42, 0.5) 50%, #020617 100%);
+  --gradient-radial-top-left: radial-gradient(ellipse at top left, rgba(15, 23, 42, 0.4), transparent 50%);
+  --gradient-radial-top-right: radial-gradient(ellipse at top right, rgba(15, 23, 42, 0.3), transparent 50%);
+  --gradient-bottom-glow: linear-gradient(to top, rgba(15, 23, 42, 0.2), transparent);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Monospace for cryptographic primitives */
+.font-mono,
+code,
+.crypto-data,
+.address,
+.amount,
+.signature,
+.handle {
+  font-family: 'IBM Plex Mono', 'SF Mono', Consolas, monospace;
+  font-feature-settings: 'tnum' 1;
+}
+
+/* Scrollbar - Minimal */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--slate-700);
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--slate-600);
+}
+
+/* Selection */
+::selection {
+  background: rgba(59, 130, 246, 0.3);
+  color: var(--text-primary);
+}
+
+/* Wallet Adapter Overrides */
+.wallet-adapter-button {
+  background: var(--bg-elevated) !important;
+  border: 1px solid var(--border-subtle) !important;
+  border-radius: 2px !important;
+  font-family: 'Inter', sans-serif !important;
+  font-weight: 500 !important;
+  font-size: 12px !important;
+  height: 32px !important;
+  padding: 0 12px !important;
+  color: var(--text-secondary) !important;
+}
+
+.wallet-adapter-button:hover {
+  background: var(--bg-muted) !important;
+  border-color: var(--border-default) !important;
+  color: var(--text-primary) !important;
+}
+
+.wallet-adapter-modal-wrapper {
+  background: var(--bg-surface) !important;
+  border: 1px solid var(--border-subtle) !important;
+  border-radius: 2px !important;
+}
+
+/* Institutional Component Styles */
+.btn-primary {
+  background: var(--status-info);
+  color: white;
+  border: none;
+  border-radius: 2px;
+  font-weight: 500;
+  font-size: 12px;
+  padding: 6px 12px;
+  transition: opacity 0.15s;
+}
+
+.btn-primary:hover {
+  opacity: 0.9;
+}
+
+.btn-secondary {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+  border-radius: 2px;
+  font-weight: 500;
+  font-size: 12px;
+  padding: 6px 12px;
+}
+
+.btn-secondary:hover {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border-color: var(--border-default);
+}
+
+/* Data Table Styles */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.data-table th {
+  text-align: left;
+  padding: 8px 12px;
+  font-weight: 500;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-subtle);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.data-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  vertical-align: middle;
+}
+
+.data-table tr:hover td {
+  background: var(--bg-elevated);
+}
+
+/* Status Badge */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  border-radius: 2px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+}
+
+.status-badge.success {
+  color: var(--status-success);
+  border-color: rgba(16, 185, 129, 0.3);
+}
+
+.status-badge.warning {
+  color: var(--status-warning);
+  border-color: rgba(245, 158, 11, 0.3);
+}
+
+.status-badge.critical {
+  color: var(--status-critical);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+.status-badge.info {
+  color: var(--status-info);
+  border-color: rgba(59, 130, 246, 0.3);
+}
+
+/* Confidentiality Indicator */
+.confidentiality-encrypted {
+  color: var(--fhe-encrypted);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+}
+
+.confidentiality-decrypted {
+  color: var(--fhe-decrypted);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  animation: reveal 0.3s ease-out;
+}
+
+@keyframes reveal {
+  0% { opacity: 0.5; filter: blur(2px); }
+  100% { opacity: 1; filter: blur(0); }
+}
+
+/* Console Styles */
+.console-output {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  background: var(--bg-base);
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.console-line {
+  display: flex;
+  gap: 8px;
+}
+
+.console-timestamp {
+  color: var(--text-subtle);
+  flex-shrink: 0;
+}
+
+.console-level-info { color: var(--status-info); }
+.console-level-success { color: var(--status-success); }
+.console-level-warning { color: var(--status-warning); }
+.console-level-error { color: var(--status-critical); }
+
+/* Input Styles */
+input[type="text"],
+input[type="number"],
+select {
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  border-radius: 2px;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-primary);
+  transition: border-color 0.15s;
+}
+
+input[type="text"]:focus,
+input[type="number"]:focus,
+select:focus {
+  border-color: var(--status-info);
+  outline: none;
+}
+
+input::placeholder {
+  color: var(--text-subtle);
+}
+
+/* Focus States */
+button:focus-visible,
+a:focus-visible {
+  outline: 1px solid var(--status-info);
+  outline-offset: 1px;
+}
+
+/* Loading Spinner */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  animation: spin 1s linear infinite;
+}
+
+/* Transition utilities */
+.transition-opacity {
+  transition: opacity 0.15s ease;
+}
+
+.transition-colors {
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}

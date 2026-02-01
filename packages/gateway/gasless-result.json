@@ -1,0 +1,16 @@
+{
+  "success": true,
+  "data": {
+    "available": true,
+    "feePayer": "2wKupLR9q6wXYppw8Gr2NvWxKBUqm4PPJKkQfoxHDBg4",
+    "facilitatorUrl": "https://facilitator.payai.network",
+    "benefits": [
+      "Stealth wallets need USDC only - NO SOL required!",
+      "PayAI pays all transaction fees",
+      "No rent locked in stealth wallets",
+      "True gasless privacy payments"
+    ]
+  },
+  "message": "⚡ GASLESS PAYMENTS AVAILABLE! Stealth wallets need USDC only - no SOL!",
+  "timestamp": 1768420969071
+}
