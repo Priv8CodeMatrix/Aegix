@@ -585,7 +585,15 @@ export default function StealthPayment({
         
         // Handle insufficient compressed funds when privacy selected
         if (result.errorCode === 'INSUFFICIENT_COMPRESSED') {
-          setError(`Insufficient compressed funds. Shield more USDC or use standard payment.`);
+          // User has regular USDC but not enough shielded - prompt to shield
+          const details = result.details || {};
+          setShieldingInfo({
+            regularUsdc: parseFloat(details.regularUsdc || pool?.balance?.usdc || '0'),
+            compressedUsdc: parseFloat(details.compressedUsdc || '0'),
+            required: parseFloat(inputAmount),
+          });
+          setNeedsShielding(true);
+          setError(null); // Clear error, we'll show the shield prompt instead
           setStep('ready');
           return;
         }
@@ -735,6 +743,8 @@ export default function StealthPayment({
     setNeedsTopUp(null);
     setTopUpAmount({ sol: 0, usdc: 0 });
     setPendingPayment(null);
+    setNeedsShielding(false);
+    setShieldingInfo(null);
   };
 
   // Custom deposit to pool (SOL and/or USDC)
@@ -1284,23 +1294,26 @@ export default function StealthPayment({
             {renderPoolStatus()}
             {renderRecoveryPoolStatus()}
             
-            {/* Top-Up Required */}
+            {/* Stealth Pool Top-Up Required (NOT Recovery Pool!) */}
             {needsTopUp && (
               <div className="p-3 border border-status-warning/30 bg-status-warning/5">
                 <div className="flex items-center gap-2 mb-2">
                   <AlertCircle className="w-4 h-4 text-status-warning" />
-                  <span className="text-xs font-medium text-status-warning">INSUFFICIENT_FUNDS</span>
+                  <span className="text-xs font-medium text-status-warning">STEALTH_POOL_INSUFFICIENT</span>
                 </div>
-                <div className="space-y-1 mb-3">
+                <p className="text-[10px] text-slate-400 mb-2">
+                  Your Stealth Pool needs more funds for this payment:
+                </p>
+                <div className="space-y-1 mb-3 bg-slate-800/50 p-2 border border-slate-700">
                   {(needsTopUp === 'sol' || needsTopUp === 'both') && (
                     <div className="flex items-center justify-between text-xs">
-                      <span className="text-slate-500">SOL_REQUIRED</span>
+                      <span className="text-slate-400">SOL (for gas)</span>
                       <span className="font-mono text-status-warning">+{topUpAmount.sol.toFixed(4)}</span>
                     </div>
                   )}
                   {(needsTopUp === 'usdc' || needsTopUp === 'both') && (
                     <div className="flex items-center justify-between text-xs">
-                      <span className="text-slate-500">USDC_REQUIRED</span>
+                      <span className="text-slate-400">USDC (for payment)</span>
                       <span className="font-mono text-status-warning">+{topUpAmount.usdc.toFixed(2)}</span>
                     </div>
                   )}
@@ -1312,7 +1325,7 @@ export default function StealthPayment({
                     className="flex-1 py-2 bg-status-warning text-slate-950 text-xs font-medium disabled:opacity-50 flex items-center justify-center gap-1.5"
                   >
                     {isTopingUp ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
-                    TOP_UP_AND_PAY
+                    ADD_TO_STEALTH_POOL
                   </button>
                   <button
                     onClick={cancelTopUp}
@@ -1322,11 +1335,68 @@ export default function StealthPayment({
                     CANCEL
                   </button>
                 </div>
+                <p className="text-[9px] text-slate-500 mt-2">
+                  Note: Recovery Pool (for fees) is separate and only needs SOL.
+                </p>
+              </div>
+            )}
+
+            {/* Needs Shielding Prompt - When user has regular USDC but needs to shield for privacy payment */}
+            {needsShielding && !needsTopUp && shieldingInfo && (
+              <div className="p-3 border border-emerald-500/30 bg-emerald-500/5">
+                <div className="flex items-center gap-2 mb-2">
+                  <Shield className="w-4 h-4 text-emerald-400" />
+                  <span className="text-xs font-medium text-emerald-400">SHIELD_REQUIRED</span>
+                </div>
+                <p className="text-[10px] text-slate-300 mb-2">
+                  You have <span className="text-emerald-400 font-mono">{shieldingInfo.regularUsdc.toFixed(2)} USDC</span> in your pool, 
+                  but need <span className="text-emerald-400 font-mono">shielded USDC</span> for Maximum Privacy payments.
+                </p>
+                <div className="bg-slate-800/50 p-2 border border-slate-700 mb-3">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-400">Regular USDC</span>
+                    <span className="font-mono text-slate-300">{shieldingInfo.regularUsdc.toFixed(2)}</span>
+                  </div>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-slate-400">Shielded USDC</span>
+                    <span className="font-mono text-amber-400">{shieldingInfo.compressedUsdc.toFixed(2)}</span>
+                  </div>
+                  <div className="flex items-center justify-between text-xs mt-1 pt-1 border-t border-slate-700">
+                    <span className="text-slate-400">Payment Amount</span>
+                    <span className="font-mono text-slate-300">{shieldingInfo.required.toFixed(2)} USDC</span>
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => {
+                      setNeedsShielding(false);
+                      setShieldingInfo(null);
+                      openShieldModal();
+                    }}
+                    className="flex-1 py-2 bg-emerald-600 text-white text-xs font-medium flex items-center justify-center gap-1.5 hover:bg-emerald-500"
+                  >
+                    <Shield className="w-3.5 h-3.5" />
+                    SHIELD_FUNDS
+                  </button>
+                  <button
+                    onClick={() => {
+                      setNeedsShielding(false);
+                      setShieldingInfo(null);
+                      setUsePrivacyHardened(false);
+                    }}
+                    className="px-3 py-2 border border-slate-700 text-slate-400 text-xs hover:border-slate-600"
+                  >
+                    USE_STANDARD
+                  </button>
+                </div>
+                <p className="text-[9px] text-slate-500 mt-2">
+                  Shielding compresses your USDC for ~50x cheaper transactions with full privacy.
+                </p>
               </div>
             )}
             
             {/* Payment Form */}
-            {!needsTopUp && (
+            {!needsTopUp && !needsShielding && (
               <>
                 <div>
                   <label className="block text-[10px] font-mono text-slate-500 mb-1">
