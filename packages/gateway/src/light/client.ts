@@ -21,7 +21,9 @@ import {
   Transaction,
   Connection,
   LAMPORTS_PER_SOL,
+  ComputeBudgetProgram,
 } from '@solana/web3.js';
+import crypto from 'crypto';
 import {
   getAssociatedTokenAddress,
   createTransferInstruction,
@@ -1686,12 +1688,8 @@ export async function decompressAndTransfer(
     console.log(`[Light]   ✓ PayAI fee payer: ${payaiFeePayer.slice(0, 12)}... (THEY PAY GAS!)`);
     
     // Import for TransferChecked (required by x402)
-    const { createTransferCheckedInstruction, ComputeBudgetProgram } = await import('@solana/web3.js')
-      .then(() => import('@solana/spl-token'))
-      .then(splToken => ({ 
-        createTransferCheckedInstruction: splToken.createTransferCheckedInstruction,
-        ComputeBudgetProgram: require('@solana/web3.js').ComputeBudgetProgram 
-      }));
+    const { createTransferCheckedInstruction } = await import('@solana/spl-token');
+    // ComputeBudgetProgram is already imported at the top of the file
     
     // Check if recipient ATA exists, create if needed (Recovery pays this)
     let recipientAtaExists = false;
@@ -2050,7 +2048,7 @@ async function getDefaultMerkleTree(): Promise<string> {
  * Generate a deterministic proof hash for tracking
  */
 function generateProofHash(...inputs: string[]): string {
-  const crypto = require('crypto');
+  // crypto is imported at the top of the file (ESM)
   return crypto
     .createHash('sha256')
     .update(inputs.join(':'))
