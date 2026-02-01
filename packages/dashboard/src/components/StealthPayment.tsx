@@ -540,10 +540,26 @@ export default function StealthPayment({
     
     // Check if pool has compressed/shielded funds available
     const compressedUsdc = (pool.balance as any)?.compressedUsdc || 0;
+    const regularUsdc = pool.balance?.usdc || 0;
     const paymentAmount = parseFloat(inputAmount);
     const hasEnoughShielded = compressedUsdc >= paymentAmount;
+    const hasEnoughRegular = regularUsdc >= paymentAmount;
+    const hasSomeShielded = compressedUsdc > 0;
     
-    console.log('[Payment] Checking shielded balance:', { compressedUsdc, paymentAmount, hasEnoughShielded });
+    console.log('[Payment] Checking balances:', { compressedUsdc, regularUsdc, paymentAmount, hasEnoughShielded, hasEnoughRegular });
+    
+    // If user has SOME shielded funds but NOT ENOUGH for this payment, prompt to shield more
+    if (hasSomeShielded && !hasEnoughShielded && hasEnoughRegular) {
+      const shortfall = paymentAmount - compressedUsdc;
+      setShieldingInfo({
+        regularUsdc,
+        compressedUsdc,
+        required: paymentAmount,
+      });
+      setNeedsShielding(true);
+      setError(`Payment requires ${paymentAmount.toFixed(2)} USDC but you only have ${compressedUsdc.toFixed(2)} shielded. Shield ${shortfall.toFixed(2)} more USDC or use Standard payment.`);
+      return;
+    }
     
     setHasCompressedFunds(hasEnoughShielded);
     setUsePrivacyHardened(hasEnoughShielded); // Default to Maximum Privacy if shielded funds available
