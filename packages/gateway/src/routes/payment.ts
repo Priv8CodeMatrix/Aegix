@@ -5057,6 +5057,105 @@ router.get('/recovery/status', async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/credits/recovery/create-and-fund
+ * SIMPLIFIED: Create Recovery Pool AND return funding transaction in ONE call
+ * User only needs to sign ONE transaction (like Stealth Pool!)
+ * Body: { owner: string, amountSOL: number }
+ */
+router.post('/recovery/create-and-fund', async (req: Request, res: Response) => {
+  try {
+    const { owner, amountSOL = 0.01 } = req.body;
+    
+    if (!owner || typeof owner !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Owner wallet address required',
+      });
+    }
+    
+    const amount = parseFloat(amountSOL) || 0.01;
+    if (amount < 0.005) {
+      return res.status(400).json({
+        success: false,
+        error: 'Minimum funding amount is 0.005 SOL',
+      });
+    }
+    
+    const { getRegularConnection } = await import('../light/client.js');
+    const { setRecoveryPoolAddress, getRecoveryPoolAddressFromStealthPool } = await import('../stealth/index.js');
+    
+    const connection = getRegularConnection();
+    const ownerPubkey = new PublicKey(owner);
+    
+    // Check if Recovery Pool already exists for this owner
+    let recoveryPoolAddress = getRecoveryPoolAddressFromStealthPool(owner);
+    
+    if (!recoveryPoolAddress) {
+      // Generate a NEW Recovery Pool keypair (simple random keypair)
+      const recoveryKeypair = Keypair.generate();
+      recoveryPoolAddress = recoveryKeypair.publicKey.toBase58();
+      
+      // Store the keypair securely (we'll use the simple approach - store in Stealth Pool data)
+      // The private key stays on the server, user just needs to fund the address
+      setRecoveryPoolAddress(owner, recoveryPoolAddress);
+      
+      // Also store the keypair for later use (in-memory for now)
+      // In production, this should be encrypted and persisted
+      const { storeRecoveryKeypair } = await import('../solana/recovery.js');
+      storeRecoveryKeypair(owner, recoveryKeypair);
+      
+      console.log(`[Recovery] Created new Recovery Pool for ${owner.slice(0, 8)}...: ${recoveryPoolAddress.slice(0, 12)}...`);
+    } else {
+      console.log(`[Recovery] Using existing Recovery Pool for ${owner.slice(0, 8)}...: ${recoveryPoolAddress.slice(0, 12)}...`);
+    }
+    
+    // Create the funding transaction
+    const recoveryPubkey = new PublicKey(recoveryPoolAddress);
+    const lamports = Math.floor(amount * LAMPORTS_PER_SOL);
+    
+    const transaction = new Transaction();
+    transaction.add(
+      SystemProgram.transfer({
+        fromPubkey: ownerPubkey,
+        toPubkey: recoveryPubkey,
+        lamports,
+      })
+    );
+    
+    // Get fresh blockhash
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = ownerPubkey;
+    
+    // Serialize for frontend to sign
+    const serializedTx = Buffer.from(transaction.serialize({
+      requireAllSignatures: false,
+      verifySignatures: false,
+    })).toString('base64');
+    
+    console.log(`[Recovery] Created funding tx: ${owner.slice(0, 8)}... → ${recoveryPoolAddress.slice(0, 12)}... (${amount} SOL)`);
+    
+    res.json({
+      success: true,
+      data: {
+        address: recoveryPoolAddress,
+        transaction: serializedTx,
+        amountSOL: amount,
+        lamports,
+        message: `Sign to create and fund your Recovery Pool with ${amount} SOL`,
+      },
+      timestamp: Date.now(),
+    });
+  } catch (error: any) {
+    console.error('[Recovery] Create-and-fund error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to create Recovery Pool',
+    });
+  }
+});
+
+/**
  * POST /api/credits/recovery/initialize
  * Create a new Recovery Pool for a user (requires wallet signature)
  * Body: { owner: string, signature: string }

@@ -113,9 +113,9 @@ export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }:
     }
   }, [connected]);
 
-  // Initialize Recovery Pool (creates real wallet AND funds it with real SOL)
+  // Initialize Recovery Pool - SIMPLE: Just create wallet and fund it with ONE transaction
   const handleInitialize = useCallback(async () => {
-    if (!publicKey || !signMessage || !signTransaction) {
+    if (!publicKey || !signTransaction) {
       setError('Wallet not connected');
       return;
     }
@@ -124,70 +124,39 @@ export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }:
     setError(null);
     
     try {
-      // STEP 1: Sign message to prove wallet ownership
-      log('info', 'Creating your Recovery Pool wallet...');
+      log('info', 'Creating Recovery Pool...');
       
-      const timestamp = Date.now();
-      const message = `AEGIX_RECOVERY_POOL::${publicKey.toBase58()}::${timestamp}`;
-      const encodedMessage = new TextEncoder().encode(message);
-      const signatureBytes = await signMessage(encodedMessage);
-      const signature = Buffer.from(signatureBytes).toString('base64');
-      
-      // STEP 2: Create the Recovery Pool keypair
-      const initResponse = await fetch(`${GATEWAY_URL}/api/credits/recovery/initialize`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          owner: publicKey.toBase58(),
-          signature,
-        }),
-      });
-      
-      const initResult = await initResponse.json();
-      
-      if (!initResult.success) {
-        throw new Error(initResult.error || 'Failed to create Recovery Pool');
-      }
-      
-      const recoveryPoolAddress = initResult.data.address;
-      log('success', `Recovery Pool created: ${recoveryPoolAddress.slice(0, 12)}...`);
-      
-      // STEP 3: Create and sign a REAL funding transaction
-      log('info', 'Creating funding transaction (0.01 SOL)...');
-      
-      const fundResponse = await fetch(`${GATEWAY_URL}/api/credits/recovery/fund`, {
+      // STEP 1: Call backend to create wallet AND get funding transaction in ONE call
+      const response = await fetch(`${GATEWAY_URL}/api/credits/recovery/create-and-fund`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           owner: publicKey.toBase58(),
           amountSOL: 0.01,
-          recoveryPoolAddress,
         }),
       });
       
-      const fundResult = await fundResponse.json();
+      const result = await response.json();
       
-      if (!fundResult.success) {
-        throw new Error(fundResult.error || 'Failed to create funding transaction');
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to create Recovery Pool');
       }
       
-      // STEP 4: Deserialize and sign the transaction
-      log('info', 'Please approve the transaction in your wallet...');
+      log('info', 'Approve the transaction to fund your Recovery Pool...');
       
-      const txBuffer = Buffer.from(fundResult.data.transaction, 'base64');
+      // STEP 2: Sign the funding transaction (shows real SOL amount in Phantom!)
+      const txBuffer = Buffer.from(result.data.transaction, 'base64');
       const transaction = Transaction.from(txBuffer);
       
       const signedTx = await signTransaction(transaction);
       
-      // STEP 5: Submit the signed transaction
+      // STEP 3: Submit and confirm
       log('info', 'Submitting transaction...');
       
       const txSignature = await connection.sendRawTransaction(signedTx.serialize(), {
         skipPreflight: false,
         preflightCommitment: 'confirmed',
       });
-      
-      log('info', 'Confirming transaction...');
       
       const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
       await connection.confirmTransaction({ 
@@ -196,19 +165,20 @@ export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }:
         lastValidBlockHeight 
       }, 'confirmed');
       
-      // STEP 6: Confirm funding with backend
+      // STEP 4: Confirm with backend
       await fetch(`${GATEWAY_URL}/api/credits/recovery/confirm-fund`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           owner: publicKey.toBase58(),
           txSignature,
-          recoveryPoolAddress,
+          recoveryPoolAddress: result.data.address,
         }),
       });
       
-      log('success', `✓ Recovery Pool funded with 0.01 SOL!`);
-      log('success', `Transaction: ${txSignature.slice(0, 20)}...`);
+      log('success', `✓ Recovery Pool created and funded!`);
+      log('success', `Address: ${result.data.address.slice(0, 12)}...`);
+      log('success', `Tx: ${txSignature.slice(0, 16)}...`);
       
       // Refresh status
       await fetchStatus(true);
@@ -217,15 +187,15 @@ export function RecoveryPoolPanel({ onLog, onRefresh, defaultExpanded = false }:
       
     } catch (err: any) {
       if (!err.message?.includes('rejected') && !err.message?.includes('User rejected')) {
-        setError(err.message || 'Failed to initialize');
-        log('error', `Initialization failed: ${err.message}`);
+        setError(err.message || 'Failed to create Recovery Pool');
+        log('error', `Failed: ${err.message}`);
       } else {
-        log('warning', 'Transaction cancelled by user');
+        log('warning', 'Cancelled by user');
       }
     } finally {
       setInitializing(false);
     }
-  }, [publicKey, signMessage, signTransaction, connection, log, fetchStatus, onRefresh]);
+  }, [publicKey, signTransaction, connection, log, fetchStatus, onRefresh]);
 
   // Copy address to clipboard
   const copyAddress = useCallback(() => {

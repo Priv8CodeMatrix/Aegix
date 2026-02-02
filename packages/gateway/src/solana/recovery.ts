@@ -277,6 +277,36 @@ export function getPendingReservationsTotal(owner: string): number {
 }
 
 // =============================================================================
+// SIMPLE KEYPAIR STORAGE - For Recovery Pools created via create-and-fund
+// =============================================================================
+
+// Simple in-memory storage for Recovery Pool keypairs (keyed by owner wallet)
+const simpleRecoveryKeypairs = new Map<string, Keypair>();
+
+/**
+ * Store a Recovery Pool keypair for an owner (simple approach, no encryption)
+ * This is used when creating Recovery Pool via the simplified create-and-fund flow
+ */
+export function storeRecoveryKeypair(owner: string, keypair: Keypair): void {
+  simpleRecoveryKeypairs.set(owner, keypair);
+  console.log(`[Recovery] Stored keypair for ${owner.slice(0, 8)}...: ${keypair.publicKey.toBase58().slice(0, 12)}...`);
+}
+
+/**
+ * Get a stored Recovery Pool keypair for an owner
+ */
+export function getStoredRecoveryKeypair(owner: string): Keypair | null {
+  return simpleRecoveryKeypairs.get(owner) || null;
+}
+
+/**
+ * Check if we have a stored keypair for an owner
+ */
+export function hasStoredRecoveryKeypair(owner: string): boolean {
+  return simpleRecoveryKeypairs.has(owner);
+}
+
+// =============================================================================
 // SECURITY: Rate Limiting for Decompress Operations (Per-User)
 // =============================================================================
 
