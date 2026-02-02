@@ -61,6 +61,8 @@ interface PersistedPoolMetadata {
   encryptedSecretKey?: string;
   encryptionSalt?: string;
   creationSignature?: string;
+  // Recovery Pool address (persisted here for reliability after redeploys)
+  recoveryPoolAddress?: string;
 }
 
 // Ensure data directory exists
@@ -134,6 +136,8 @@ function savePoolsToDisk() {
         encryptedSecretKey: pool.encryptedSecretKey,
         encryptionSalt: pool.encryptionSalt,
         creationSignature: pool.creationSignature,
+        // Include Recovery Pool address for persistence
+        recoveryPoolAddress: pool.recoveryPoolAddress,
       });
     });
     
@@ -240,6 +244,8 @@ export interface StealthPool {
   totalSolRecovered: number;   // Total SOL recovered from temp burners
   status: 'created' | 'funded' | 'active';
   isLocked?: boolean;          // True if pool exists but key not in memory (needs re-auth)
+  needsReauth?: boolean;       // Alternative flag for re-authentication
+  recoveryPoolAddress?: string; // User's Recovery Pool address (persisted here for reliability)
 }
 
 // Temp burners are disposable - created per payment, then SOL recovered
@@ -306,9 +312,15 @@ persistedPools.forEach((metadata, poolId) => {
     encryptedSecretKey: metadata.encryptedSecretKey,
     encryptionSalt: metadata.encryptionSalt,
     creationSignature: metadata.creationSignature,
+    // Restore Recovery Pool address
+    recoveryPoolAddress: metadata.recoveryPoolAddress,
   };
   poolRegistry.set(poolId, lockedPool);
   ownerPoolIndex.set(metadata.owner, poolId);
+  
+  if (metadata.recoveryPoolAddress) {
+    console.log(`[Stealth] Restored Recovery Pool address for ${metadata.owner.slice(0, 8)}...: ${metadata.recoveryPoolAddress.slice(0, 12)}...`);
+  }
 });
 
 if (persistedPools.size > 0) {
@@ -603,6 +615,39 @@ export function getPoolWallet(ownerWallet: string): (StealthPool & { needsReauth
  */
 export function getPoolById(poolId: string): StealthPool | null {
   return poolRegistry.get(poolId) || null;
+}
+
+/**
+ * Set Recovery Pool address on a Stealth Pool
+ * This persists the Recovery Pool address alongside the Stealth Pool data
+ * so it survives server restarts/redeploys
+ */
+export function setRecoveryPoolAddress(ownerWallet: string, recoveryPoolAddress: string): boolean {
+  const poolId = ownerPoolIndex.get(ownerWallet);
+  if (!poolId) {
+    console.warn(`[Pool] Cannot set Recovery Pool address - no Stealth Pool found for ${ownerWallet.slice(0, 8)}...`);
+    return false;
+  }
+  
+  const pool = poolRegistry.get(poolId);
+  if (!pool) {
+    console.warn(`[Pool] Cannot set Recovery Pool address - pool not in registry: ${poolId}`);
+    return false;
+  }
+  
+  pool.recoveryPoolAddress = recoveryPoolAddress;
+  savePoolsToDisk();
+  
+  console.log(`[Pool] ✓ Recovery Pool address saved for ${ownerWallet.slice(0, 8)}...: ${recoveryPoolAddress.slice(0, 12)}...`);
+  return true;
+}
+
+/**
+ * Get Recovery Pool address for an owner from their Stealth Pool data
+ */
+export function getRecoveryPoolAddressFromStealthPool(ownerWallet: string): string | null {
+  const pool = getPoolWallet(ownerWallet);
+  return pool?.recoveryPoolAddress || null;
 }
 
 /**

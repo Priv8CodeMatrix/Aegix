@@ -2798,7 +2798,7 @@ router.post('/pool/top-up', async (req: Request, res: Response) => {
  */
 router.post('/pool/pay', async (req: Request, res: Response) => {
   try {
-    const { owner, recipient, amountUSDC, useCompressed = false } = req.body;
+    const { owner, recipient, amountUSDC, useCompressed = false, recoveryPoolAddress: bodyRecoveryAddress } = req.body;
     
     // CRITICAL: Log exactly what we received
     console.log(`[Pool] ════════════════════════════════════════════════════════`);
@@ -2809,6 +2809,7 @@ router.post('/pool/pay', async (req: Request, res: Response) => {
     console.log(`[Pool]   useCompressed (from body): ${req.body.useCompressed}`);
     console.log(`[Pool]   useCompressed (with default): ${useCompressed}`);
     console.log(`[Pool]   Mode: ${useCompressed ? '🔒 COMPRESSED' : '📤 STANDARD'}`);
+    console.log(`[Pool]   Recovery Pool (from body): ${bodyRecoveryAddress?.slice(0, 12) || 'not provided'}...`);
     console.log(`[Pool] ════════════════════════════════════════════════════════`);
     
     if (!owner || !recipient || !amountUSDC) {
@@ -2864,19 +2865,50 @@ router.post('/pool/pay', async (req: Request, res: Response) => {
       const haveShieldedUsdc = balance?.compressedUsdc || 0;
       const requiredSolForCompressed = 0.001; // Minimal SOL needed for compressed tx
       
-      // Get Recovery Pool balance (this is where SOL fees come from)
-      const { getRecoveryPoolStatus, hasRecoveryPool } = await import('../solana/recovery.js');
+      // ═══════════════════════════════════════════════════════════════════════════
+      // CRITICAL FIX: Get Recovery Pool address from MULTIPLE sources (reliability)
+      // 1. From request body (if frontend passes it)
+      // 2. From Stealth Pool data (persisted, survives redeploys)
+      // 3. Fetch balance DIRECTLY from blockchain (don't trust in-memory registry)
+      // ═══════════════════════════════════════════════════════════════════════════
+      
+      const { getRecoveryPoolAddressFromStealthPool } = await import('../stealth/index.js');
+      
+      // Try to get Recovery Pool address from body first, then from Stealth Pool data
+      let recoveryPoolAddress = bodyRecoveryAddress || getRecoveryPoolAddressFromStealthPool(owner);
       
       let haveRecoverySol = 0;
-      if (hasRecoveryPool(owner)) {
-        const recoveryStatus = await getRecoveryPoolStatus(owner, connection);
-        haveRecoverySol = recoveryStatus?.balance || 0;
+      
+      if (recoveryPoolAddress) {
+        try {
+          // Fetch balance DIRECTLY from blockchain - most reliable!
+          const recoveryPubkey = new PublicKey(recoveryPoolAddress);
+          const recoveryBalance = await connection.getBalance(recoveryPubkey, 'confirmed');
+          haveRecoverySol = recoveryBalance / LAMPORTS_PER_SOL;
+          console.log(`[Pool] ✓ Recovery Pool balance (on-chain): ${haveRecoverySol.toFixed(6)} SOL at ${recoveryPoolAddress.slice(0, 12)}...`);
+        } catch (e: any) {
+          console.warn(`[Pool] Failed to fetch Recovery Pool balance: ${e.message}`);
+        }
+      } else {
+        console.warn(`[Pool] No Recovery Pool address found for ${owner.slice(0, 8)}...`);
       }
       
       const needMoreShieldedUsdc = haveShieldedUsdc < requiredUsdc;
       const needMoreRecoverySol = haveRecoverySol < requiredSolForCompressed;
+      const noRecoveryPool = !recoveryPoolAddress;
       
-      console.log(`[Pool] Compressed validation: ShieldedUSDC=${haveShieldedUsdc}, Required=${requiredUsdc}, RecoverySol=${haveRecoverySol}`);
+      console.log(`[Pool] Compressed validation: ShieldedUSDC=${haveShieldedUsdc.toFixed(4)}, Required=${requiredUsdc}, RecoverySol=${haveRecoverySol.toFixed(4)}, HasRecoveryPool=${!!recoveryPoolAddress}`);
+      
+      if (noRecoveryPool) {
+        return res.status(400).json({
+          success: false,
+          error: 'RECOVERY_POOL_NOT_FOUND',
+          errorCode: 'RECOVERY_POOL_NOT_FOUND',
+          message: 'Recovery Pool not found. Please initialize and fund your Recovery Pool first.',
+          hint: 'Go to Stealth Pool Channel → Recovery Pool → Initialize',
+          timestamp: Date.now(),
+        });
+      }
       
       if (needMoreShieldedUsdc || needMoreRecoverySol) {
         const errorCode = needMoreShieldedUsdc && needMoreRecoverySol ? 'INSUFFICIENT_BOTH' 
@@ -2898,12 +2930,13 @@ router.post('/pool/pay', async (req: Request, res: Response) => {
               required: requiredSolForCompressed,
               shortfall: Math.max(0, requiredSolForCompressed - haveRecoverySol),
             },
+            recoveryPoolAddress,
           },
           message: needMoreShieldedUsdc && needMoreRecoverySol 
             ? `Need ${(requiredUsdc - haveShieldedUsdc).toFixed(4)} more shielded USDC and ${(requiredSolForCompressed - haveRecoverySol).toFixed(4)} more SOL in Recovery Pool`
             : needMoreShieldedUsdc 
               ? `Need ${(requiredUsdc - haveShieldedUsdc).toFixed(4)} more shielded USDC (you have ${haveShieldedUsdc.toFixed(4)} shielded)`
-              : `Need ${(requiredSolForCompressed - haveRecoverySol).toFixed(4)} more SOL in Recovery Pool (current: ${haveRecoverySol.toFixed(4)})`,
+              : `Need ${(requiredSolForCompressed - haveRecoverySol).toFixed(4)} more SOL in Recovery Pool (current: ${haveRecoverySol.toFixed(4)} SOL)`,
           hint: needMoreShieldedUsdc ? 'Shield more USDC using the "Shield More Funds" button' : 'Add SOL to your Recovery Pool',
           timestamp: Date.now(),
         });
@@ -5091,6 +5124,164 @@ router.post('/recovery/initialize', async (req: Request, res: Response) => {
     res.status(500).json({
       success: false,
       error: error.message || 'Failed to initialize Recovery Pool',
+    });
+  }
+});
+
+/**
+ * POST /api/credits/recovery/fund
+ * Create a real funding transaction for the Recovery Pool
+ * This creates a SystemProgram.transfer transaction for the user to sign
+ * Body: { owner: string, amountSOL: number, recoveryPoolAddress: string }
+ */
+router.post('/recovery/fund', async (req: Request, res: Response) => {
+  try {
+    const { owner, amountSOL, recoveryPoolAddress } = req.body;
+    
+    if (!owner || typeof owner !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Owner wallet address required',
+      });
+    }
+    
+    if (!recoveryPoolAddress || typeof recoveryPoolAddress !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Recovery Pool address required',
+      });
+    }
+    
+    const amount = parseFloat(amountSOL) || 0.01;
+    if (amount < 0.005) {
+      return res.status(400).json({
+        success: false,
+        error: 'Minimum funding amount is 0.005 SOL',
+      });
+    }
+    
+    const { getRegularConnection } = await import('../light/client.js');
+    const { setRecoveryPoolAddress } = await import('../stealth/index.js');
+    
+    const connection = getRegularConnection();
+    const ownerPubkey = new PublicKey(owner);
+    const recoveryPubkey = new PublicKey(recoveryPoolAddress);
+    
+    // Create the funding transaction
+    const transaction = new Transaction();
+    const lamports = Math.floor(amount * LAMPORTS_PER_SOL);
+    
+    transaction.add(
+      SystemProgram.transfer({
+        fromPubkey: ownerPubkey,
+        toPubkey: recoveryPubkey,
+        lamports,
+      })
+    );
+    
+    // Get fresh blockhash
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+    transaction.recentBlockhash = blockhash;
+    transaction.feePayer = ownerPubkey;
+    
+    // Serialize for frontend to sign
+    const serializedTx = Buffer.from(transaction.serialize({
+      requireAllSignatures: false,
+      verifySignatures: false,
+    })).toString('base64');
+    
+    // Save Recovery Pool address to Stealth Pool data (for persistence)
+    setRecoveryPoolAddress(owner, recoveryPoolAddress);
+    
+    console.log(`[Recovery] Created funding tx: ${owner.slice(0, 8)}... → ${recoveryPoolAddress.slice(0, 12)}... (${amount} SOL)`);
+    
+    res.json({
+      success: true,
+      data: {
+        transaction: serializedTx,
+        recoveryPoolAddress,
+        amountSOL: amount,
+        lamports,
+        lastValidBlockHeight,
+        message: `Sign to fund your Recovery Pool with ${amount} SOL`,
+      },
+      timestamp: Date.now(),
+    });
+  } catch (error: any) {
+    console.error('[Recovery] Fund error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to create funding transaction',
+    });
+  }
+});
+
+/**
+ * POST /api/credits/recovery/confirm-fund
+ * Confirm that funding transaction was successful
+ * Body: { owner: string, txSignature: string, recoveryPoolAddress: string }
+ */
+router.post('/recovery/confirm-fund', async (req: Request, res: Response) => {
+  try {
+    const { owner, txSignature, recoveryPoolAddress } = req.body;
+    
+    if (!owner || !txSignature || !recoveryPoolAddress) {
+      return res.status(400).json({
+        success: false,
+        error: 'Owner, txSignature, and recoveryPoolAddress required',
+      });
+    }
+    
+    const { getRegularConnection } = await import('../light/client.js');
+    const { setRecoveryPoolAddress } = await import('../stealth/index.js');
+    const { markPoolFunded, getRecoveryPoolStatus, setRecoveryConnection } = await import('../solana/recovery.js');
+    
+    const connection = getRegularConnection();
+    setRecoveryConnection(connection);
+    
+    // Verify the transaction
+    const txInfo = await connection.getTransaction(txSignature, {
+      commitment: 'confirmed',
+      maxSupportedTransactionVersion: 0,
+    });
+    
+    if (!txInfo || txInfo.meta?.err) {
+      return res.status(400).json({
+        success: false,
+        error: 'Transaction not found or failed',
+      });
+    }
+    
+    // Save Recovery Pool address to Stealth Pool (ensures persistence)
+    setRecoveryPoolAddress(owner, recoveryPoolAddress);
+    
+    // Mark as funded in recovery pool registry if it exists
+    try {
+      markPoolFunded(owner);
+    } catch (e) {
+      // Pool might not exist in recovery registry yet, that's OK
+    }
+    
+    // Get updated status
+    const status = await getRecoveryPoolStatus(owner, connection);
+    
+    console.log(`[Recovery] ✓ Funding confirmed: ${txSignature.slice(0, 20)}... Balance: ${status.balance.toFixed(4)} SOL`);
+    
+    res.json({
+      success: true,
+      data: {
+        txSignature,
+        balance: status.balance,
+        address: recoveryPoolAddress,
+        message: 'Recovery Pool funded successfully!',
+      },
+      timestamp: Date.now(),
+    });
+  } catch (error: any) {
+    console.error('[Recovery] Confirm fund error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to confirm funding',
     });
   }
 });

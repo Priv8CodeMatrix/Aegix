@@ -612,12 +612,14 @@ export default function StealthPayment({
     setError(null);
     setStep('paying');
     
-    // CRITICAL: Log exactly what we're sending
+    // CRITICAL: Include Recovery Pool address for reliability (survives redeploys)
     const paymentRequest = {
       owner: publicKey.toBase58(),
       recipient: inputRecipient,
       amountUSDC: parseFloat(inputAmount),
       useCompressed: usePrivacyHardened,
+      // Pass Recovery Pool address from frontend state (ensures backend can find it)
+      recoveryPoolAddress: recoveryPoolStatus?.address || undefined,
     };
     
     console.log(`[Payment] ════════════════════════════════════════════════════════`);
@@ -626,6 +628,7 @@ export default function StealthPayment({
     console.log(`[Payment]   Amount: ${paymentRequest.amountUSDC} USDC`);
     console.log(`[Payment]   useCompressed: ${paymentRequest.useCompressed}`);
     console.log(`[Payment]   Recipient: ${paymentRequest.recipient.slice(0, 12)}...`);
+    console.log(`[Payment]   Recovery Pool: ${paymentRequest.recoveryPoolAddress?.slice(0, 12) || 'not set'}...`);
     console.log(`[Payment] ════════════════════════════════════════════════════════`);
     
     try {
@@ -666,6 +669,13 @@ export default function StealthPayment({
         if (result.errorCode === 'INSUFFICIENT_RECOVERY_SOL') {
           const details = result.details?.recoverySol || { have: 0, required: 0.001, shortfall: 0.001 };
           setError(`Recovery Pool needs ${details.shortfall.toFixed(4)} more SOL (current: ${details.have.toFixed(4)} SOL). Add SOL to your Recovery Pool!`);
+          setStep('ready');
+          return;
+        }
+        
+        // Handle Recovery Pool not found
+        if (result.errorCode === 'RECOVERY_POOL_NOT_FOUND') {
+          setError('Recovery Pool not found. Please initialize and fund your Recovery Pool in Stealth Pool Channel first.');
           setStep('ready');
           return;
         }
