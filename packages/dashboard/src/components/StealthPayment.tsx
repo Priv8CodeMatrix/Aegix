@@ -645,22 +645,32 @@ export default function StealthPayment({
           return;
         }
         
-        // Handle insufficient compressed funds when privacy selected
-        if (result.errorCode === 'INSUFFICIENT_COMPRESSED') {
-          // User has regular USDC but not enough shielded - prompt to shield
+        // Handle insufficient SHIELDED USDC (for compressed payments)
+        if (result.errorCode === 'INSUFFICIENT_SHIELDED_USDC' || result.errorCode === 'INSUFFICIENT_COMPRESSED') {
           const details = result.details || {};
+          const shieldedHave = details.shieldedUsdc?.have || details.compressedUsdc || 0;
+          const shieldedRequired = details.shieldedUsdc?.required || parseFloat(inputAmount);
+          
           setShieldingInfo({
-            regularUsdc: parseFloat(details.regularUsdc || pool?.balance?.usdc || '0'),
-            compressedUsdc: parseFloat(details.compressedUsdc || '0'),
-            required: parseFloat(inputAmount),
+            regularUsdc: pool?.balance?.usdc || 0,
+            compressedUsdc: shieldedHave,
+            required: shieldedRequired,
           });
           setNeedsShielding(true);
-          setError(null); // Clear error, we'll show the shield prompt instead
+          setError(`Need ${(shieldedRequired - shieldedHave).toFixed(4)} more shielded USDC. Shield your regular USDC first!`);
           setStep('ready');
           return;
         }
         
-        // Check for insufficient funds
+        // Handle insufficient SOL in RECOVERY POOL (for compressed payments)
+        if (result.errorCode === 'INSUFFICIENT_RECOVERY_SOL') {
+          const details = result.details?.recoverySol || { have: 0, required: 0.001, shortfall: 0.001 };
+          setError(`Recovery Pool needs ${details.shortfall.toFixed(4)} more SOL (current: ${details.have.toFixed(4)} SOL). Add SOL to your Recovery Pool!`);
+          setStep('ready');
+          return;
+        }
+        
+        // Check for insufficient funds (standard payment - Stealth Pool)
         if (result.errorCode?.includes('INSUFFICIENT') || result.error?.includes('Insufficient')) {
           const details = result.details || { 
             sol: { shortfall: 0.001, have: 0 }, 
@@ -670,6 +680,7 @@ export default function StealthPayment({
           let topUpType: 'sol' | 'usdc' | 'both' | null = null;
           const needed = { sol: 0, usdc: 0 };
           
+          // Only show Stealth Pool top-up for standard payments
           if (details.sol?.shortfall > 0) {
             topUpType = 'sol';
             needed.sol = Math.max(0.001, details.sol.shortfall + 0.0005);

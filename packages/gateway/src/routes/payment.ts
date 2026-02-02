@@ -2852,42 +2852,102 @@ router.post('/pool/pay', async (req: Request, res: Response) => {
     const balance = await getPoolBalance(connection, pool.id);
     
     const requiredUsdc = parseFloat(amountUSDC);
-    const requiredSol = useCompressed ? 0.001 : 0.008; // Compressed needs less SOL
-    const haveUsdc = balance?.usdc || 0;
-    const haveSol = balance?.sol || 0;
     
-    // Check if insufficient funds
-    const needMoreUsdc = haveUsdc < requiredUsdc;
-    const needMoreSol = haveSol < requiredSol;
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CRITICAL FIX: For compressed payments, check the RIGHT balances:
+    // - USDC: Check SHIELDED balance (compressedUsdc), not regular usdc
+    // - SOL: Check RECOVERY POOL balance, not Stealth Pool (SOL comes from Recovery Pool)
+    // ═══════════════════════════════════════════════════════════════════════════
     
-    if (needMoreUsdc || needMoreSol) {
-      const errorCode = needMoreUsdc && needMoreSol ? 'INSUFFICIENT_BOTH' 
-                      : needMoreUsdc ? 'INSUFFICIENT_USDC' 
-                      : 'INSUFFICIENT_SOL';
+    if (useCompressed) {
+      // COMPRESSED PAYMENT: Validate shielded USDC and Recovery Pool SOL
+      const haveShieldedUsdc = balance?.compressedUsdc || 0;
+      const requiredSolForCompressed = 0.001; // Minimal SOL needed for compressed tx
       
-      return res.status(400).json({
-        success: false,
-        error: errorCode,
-        errorCode,
-        details: {
-          usdc: {
-            have: haveUsdc,
-            required: requiredUsdc,
-            shortfall: Math.max(0, requiredUsdc - haveUsdc),
+      // Get Recovery Pool balance (this is where SOL fees come from)
+      const { getRecoveryPoolStatus, hasRecoveryPool } = await import('../solana/recovery.js');
+      
+      let haveRecoverySol = 0;
+      if (hasRecoveryPool(owner)) {
+        const recoveryStatus = await getRecoveryPoolStatus(owner, connection);
+        haveRecoverySol = recoveryStatus?.balance || 0;
+      }
+      
+      const needMoreShieldedUsdc = haveShieldedUsdc < requiredUsdc;
+      const needMoreRecoverySol = haveRecoverySol < requiredSolForCompressed;
+      
+      console.log(`[Pool] Compressed validation: ShieldedUSDC=${haveShieldedUsdc}, Required=${requiredUsdc}, RecoverySol=${haveRecoverySol}`);
+      
+      if (needMoreShieldedUsdc || needMoreRecoverySol) {
+        const errorCode = needMoreShieldedUsdc && needMoreRecoverySol ? 'INSUFFICIENT_BOTH' 
+                        : needMoreShieldedUsdc ? 'INSUFFICIENT_SHIELDED_USDC' 
+                        : 'INSUFFICIENT_RECOVERY_SOL';
+        
+        return res.status(400).json({
+          success: false,
+          error: errorCode,
+          errorCode,
+          details: {
+            shieldedUsdc: {
+              have: haveShieldedUsdc,
+              required: requiredUsdc,
+              shortfall: Math.max(0, requiredUsdc - haveShieldedUsdc),
+            },
+            recoverySol: {
+              have: haveRecoverySol,
+              required: requiredSolForCompressed,
+              shortfall: Math.max(0, requiredSolForCompressed - haveRecoverySol),
+            },
           },
-          sol: {
-            have: haveSol,
-            required: requiredSol,
-            shortfall: Math.max(0, requiredSol - haveSol),
+          message: needMoreShieldedUsdc && needMoreRecoverySol 
+            ? `Need ${(requiredUsdc - haveShieldedUsdc).toFixed(4)} more shielded USDC and ${(requiredSolForCompressed - haveRecoverySol).toFixed(4)} more SOL in Recovery Pool`
+            : needMoreShieldedUsdc 
+              ? `Need ${(requiredUsdc - haveShieldedUsdc).toFixed(4)} more shielded USDC (you have ${haveShieldedUsdc.toFixed(4)} shielded)`
+              : `Need ${(requiredSolForCompressed - haveRecoverySol).toFixed(4)} more SOL in Recovery Pool (current: ${haveRecoverySol.toFixed(4)})`,
+          hint: needMoreShieldedUsdc ? 'Shield more USDC using the "Shield More Funds" button' : 'Add SOL to your Recovery Pool',
+          timestamp: Date.now(),
+        });
+      }
+    } else {
+      // STANDARD PAYMENT: Validate regular USDC and Stealth Pool SOL
+      const requiredSol = 0.008; // Standard payments need more SOL
+      const haveUsdc = balance?.usdc || 0;
+      const haveSol = balance?.sol || 0;
+      
+      const needMoreUsdc = haveUsdc < requiredUsdc;
+      const needMoreSol = haveSol < requiredSol;
+      
+      console.log(`[Pool] Standard validation: USDC=${haveUsdc}, Required=${requiredUsdc}, SOL=${haveSol}`);
+      
+      if (needMoreUsdc || needMoreSol) {
+        const errorCode = needMoreUsdc && needMoreSol ? 'INSUFFICIENT_BOTH' 
+                        : needMoreUsdc ? 'INSUFFICIENT_USDC' 
+                        : 'INSUFFICIENT_SOL';
+        
+        return res.status(400).json({
+          success: false,
+          error: errorCode,
+          errorCode,
+          details: {
+            usdc: {
+              have: haveUsdc,
+              required: requiredUsdc,
+              shortfall: Math.max(0, requiredUsdc - haveUsdc),
+            },
+            sol: {
+              have: haveSol,
+              required: requiredSol,
+              shortfall: Math.max(0, requiredSol - haveSol),
+            },
           },
-        },
-        message: needMoreUsdc && needMoreSol 
-          ? `Need ${(requiredUsdc - haveUsdc).toFixed(2)} more USDC and ${(requiredSol - haveSol).toFixed(4)} more SOL`
-          : needMoreUsdc 
-            ? `Need ${(requiredUsdc - haveUsdc).toFixed(2)} more USDC`
-            : `Need ${(requiredSol - haveSol).toFixed(4)} more SOL for gas`,
-        timestamp: Date.now(),
-      });
+          message: needMoreUsdc && needMoreSol 
+            ? `Need ${(requiredUsdc - haveUsdc).toFixed(2)} more USDC and ${(requiredSol - haveSol).toFixed(4)} more SOL`
+            : needMoreUsdc 
+              ? `Need ${(requiredUsdc - haveUsdc).toFixed(2)} more USDC`
+              : `Need ${(requiredSol - haveSol).toFixed(4)} more SOL for gas`,
+          timestamp: Date.now(),
+        });
+      }
     }
     
     const poolPubkey = new PublicKey(pool.publicKey);
