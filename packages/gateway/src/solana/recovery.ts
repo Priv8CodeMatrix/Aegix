@@ -615,9 +615,43 @@ export async function getRecoveryPoolStatus(owner: string, conn?: Connection): P
   isLocked: boolean;
   poolId: string | null;
 }> {
-  const pool = getRecoveryPoolForOwner(owner);
+  // Check MULTIPLE sources for Recovery Pool:
+  // 1. Old registry (for backward compatibility)
+  // 2. Simple keypairs storage (new simplified flow)
+  // 3. Stealth Pool data (persisted address)
   
-  if (!pool) {
+  const pool = getRecoveryPoolForOwner(owner);
+  const simpleKeypair = getStoredRecoveryKeypair(owner);
+  
+  // Import from stealth to check persisted address
+  let stealthPoolAddress: string | null = null;
+  try {
+    const { getRecoveryPoolAddressFromStealthPool } = await import('../stealth/index.js');
+    stealthPoolAddress = getRecoveryPoolAddressFromStealthPool(owner);
+  } catch (e) {
+    // Ignore import errors
+  }
+  
+  // Determine the Recovery Pool address from any available source
+  let recoveryAddress: string | null = null;
+  let recoveryPoolId: string | null = null;
+  let totalRecycled = 0;
+  let isLocked = false;
+  
+  if (pool) {
+    recoveryAddress = pool.publicKey;
+    recoveryPoolId = pool.id;
+    totalRecycled = pool.totalRecycled;
+    isLocked = pool.isLocked || false;
+  } else if (simpleKeypair) {
+    recoveryAddress = simpleKeypair.publicKey.toBase58();
+    recoveryPoolId = `simple-${owner.slice(0, 8)}`;
+  } else if (stealthPoolAddress) {
+    recoveryAddress = stealthPoolAddress;
+    recoveryPoolId = `stealth-${owner.slice(0, 8)}`;
+  }
+  
+  if (!recoveryAddress) {
     return {
       initialized: false,
       address: null,
@@ -630,17 +664,27 @@ export async function getRecoveryPoolStatus(owner: string, conn?: Connection): P
     };
   }
   
-  const balance = await getRecoveryPoolBalanceForOwner(owner, conn);
+  // Fetch balance directly from blockchain
+  let balance = 0;
+  const useConn = conn || connection;
+  if (useConn) {
+    try {
+      const balanceLamports = await useConn.getBalance(new PublicKey(recoveryAddress), 'confirmed');
+      balance = balanceLamports / LAMPORTS_PER_SOL;
+    } catch (e) {
+      console.warn(`[Recovery] Failed to fetch balance for ${owner.slice(0, 8)}...`);
+    }
+  }
   
   return {
     initialized: true,
-    address: pool.publicKey,
+    address: recoveryAddress,
     balance,
-    isHealthy: balance >= MIN_LIQUIDITY_SOL && !pool.isLocked,
-    totalRecycled: pool.totalRecycled,
+    isHealthy: balance >= MIN_LIQUIDITY_SOL && !isLocked,
+    totalRecycled,
     minRequired: MIN_LIQUIDITY_SOL,
-    isLocked: pool.isLocked || false,
-    poolId: pool.id,
+    isLocked,
+    poolId: recoveryPoolId,
   };
 }
 

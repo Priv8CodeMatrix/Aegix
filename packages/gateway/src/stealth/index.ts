@@ -617,35 +617,82 @@ export function getPoolById(poolId: string): StealthPool | null {
   return poolRegistry.get(poolId) || null;
 }
 
+// =============================================================================
+// INDEPENDENT RECOVERY POOL ADDRESS STORAGE
+// This stores Recovery Pool addresses separately from Stealth Pools
+// so Recovery Pools can be created without requiring a Stealth Pool first
+// =============================================================================
+
+const RECOVERY_ADDRESSES_FILE = path.join(DATA_DIR, 'recovery-addresses.json');
+const recoveryAddressRegistry = new Map<string, string>(); // owner -> recovery pool address
+
+// Load recovery addresses on startup
+function loadRecoveryAddresses(): void {
+  try {
+    if (fs.existsSync(RECOVERY_ADDRESSES_FILE)) {
+      const data = JSON.parse(fs.readFileSync(RECOVERY_ADDRESSES_FILE, 'utf-8'));
+      if (data.addresses) {
+        Object.entries(data.addresses).forEach(([owner, address]) => {
+          recoveryAddressRegistry.set(owner, address as string);
+        });
+        console.log(`[Recovery] Loaded ${recoveryAddressRegistry.size} recovery address(es) from disk`);
+      }
+    }
+  } catch (e) {
+    console.warn('[Recovery] Failed to load recovery-addresses.json');
+  }
+}
+
+// Save recovery addresses to disk
+function saveRecoveryAddresses(): void {
+  try {
+    ensureDataDir();
+    const data = {
+      addresses: Object.fromEntries(recoveryAddressRegistry),
+      savedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(RECOVERY_ADDRESSES_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.warn('[Recovery] Failed to save recovery-addresses.json');
+  }
+}
+
+// Load on module init
+loadRecoveryAddresses();
+
 /**
- * Set Recovery Pool address on a Stealth Pool
- * This persists the Recovery Pool address alongside the Stealth Pool data
- * so it survives server restarts/redeploys
+ * Set Recovery Pool address for an owner
+ * Stores in BOTH Stealth Pool (if exists) AND independent registry
  */
 export function setRecoveryPoolAddress(ownerWallet: string, recoveryPoolAddress: string): boolean {
+  // Always save to independent registry (works without Stealth Pool)
+  recoveryAddressRegistry.set(ownerWallet, recoveryPoolAddress);
+  saveRecoveryAddresses();
+  
+  // Also try to save to Stealth Pool if it exists
   const poolId = ownerPoolIndex.get(ownerWallet);
-  if (!poolId) {
-    console.warn(`[Pool] Cannot set Recovery Pool address - no Stealth Pool found for ${ownerWallet.slice(0, 8)}...`);
-    return false;
+  if (poolId) {
+    const pool = poolRegistry.get(poolId);
+    if (pool) {
+      pool.recoveryPoolAddress = recoveryPoolAddress;
+      savePoolsToDisk();
+    }
   }
-  
-  const pool = poolRegistry.get(poolId);
-  if (!pool) {
-    console.warn(`[Pool] Cannot set Recovery Pool address - pool not in registry: ${poolId}`);
-    return false;
-  }
-  
-  pool.recoveryPoolAddress = recoveryPoolAddress;
-  savePoolsToDisk();
   
   console.log(`[Pool] ✓ Recovery Pool address saved for ${ownerWallet.slice(0, 8)}...: ${recoveryPoolAddress.slice(0, 12)}...`);
   return true;
 }
 
 /**
- * Get Recovery Pool address for an owner from their Stealth Pool data
+ * Get Recovery Pool address for an owner
+ * Checks BOTH Stealth Pool data AND independent registry
  */
 export function getRecoveryPoolAddressFromStealthPool(ownerWallet: string): string | null {
+  // First check independent registry
+  const fromRegistry = recoveryAddressRegistry.get(ownerWallet);
+  if (fromRegistry) return fromRegistry;
+  
+  // Then check Stealth Pool data
   const pool = getPoolWallet(ownerWallet);
   return pool?.recoveryPoolAddress || null;
 }
