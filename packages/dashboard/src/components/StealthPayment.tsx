@@ -539,8 +539,13 @@ export default function StealthPayment({
   const initiatePayment = async () => {
     if (!publicKey || !pool || !inputRecipient || parseFloat(inputAmount) <= 0) return;
     
+    // Remember previous compressed balance for comparison
+    const previousCompressedUsdc = (pool.balance as any)?.compressedUsdc || 0;
+    
     // CRITICAL: Refresh balance BEFORE checking - ensures we have latest compressed balance
     console.log('[Payment] Refreshing balance before payment check...');
+    console.log('[Payment] Previous compressed balance:', previousCompressedUsdc);
+    
     try {
       const response = await fetch(`${GATEWAY_URL}/api/credits/pool/${publicKey.toBase58()}`);
       const result = await response.json();
@@ -548,8 +553,10 @@ export default function StealthPayment({
         const freshBalance = result.data.balance;
         console.log('[Payment] Fresh balance:', freshBalance);
         
-        // Update pool state with fresh balance
-        setPool(prev => prev ? { ...prev, balance: freshBalance } : null);
+        // CRITICAL: Check for compressed balance fetch errors
+        if (freshBalance.compressedUsdcError) {
+          console.warn('[Payment] Compressed balance fetch had issues:', freshBalance.compressedUsdcError);
+        }
         
         // Use fresh balance for checks
         const compressedUsdc = freshBalance.compressedUsdc || 0;
@@ -565,8 +572,24 @@ export default function StealthPayment({
           paymentAmount, 
           hasEnoughShielded, 
           hasEnoughRegular,
-          hasSomeShielded 
+          hasSomeShielded,
+          fromCache: freshBalance.compressedUsdcFromCache,
+          error: freshBalance.compressedUsdcError
         });
+        
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX: Don't silently downgrade if compressed balance suddenly dropped
+        // If user PREVIOUSLY had shielded funds but now shows 0, warn them!
+        // ═══════════════════════════════════════════════════════════════════════════
+        if (previousCompressedUsdc > 0 && compressedUsdc === 0 && !freshBalance.compressedUsdcFromCache) {
+          console.error('[Payment] ⚠️ Compressed balance dropped from', previousCompressedUsdc, 'to 0!');
+          setError(`Shielded balance check failed! You had ${previousCompressedUsdc.toFixed(4)} shielded USDC but fetch returned 0. This may be a temporary RPC issue. Click "Refresh" and try again.`);
+          // Keep previous balance in UI so user doesn't panic
+          return;
+        }
+        
+        // Update pool state with fresh balance
+        setPool(prev => prev ? { ...prev, balance: freshBalance } : null);
         
         // If user has SOME shielded funds but NOT ENOUGH for this payment, prompt to shield more
         if (hasSomeShielded && !hasEnoughShielded && hasEnoughRegular) {
@@ -581,11 +604,24 @@ export default function StealthPayment({
           return;
         }
         
-        // Set payment mode based on fresh balance
-        setHasCompressedFunds(hasEnoughShielded);
-        setUsePrivacyHardened(hasEnoughShielded); // Default to Maximum Privacy if shielded funds available
-        
-        console.log('[Payment] usePrivacyHardened set to:', hasEnoughShielded);
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CRITICAL: If user has shielded funds, ALWAYS use compressed mode
+        // NEVER silently downgrade to standard payment!
+        // ═══════════════════════════════════════════════════════════════════════════
+        if (hasEnoughShielded) {
+          setHasCompressedFunds(true);
+          setUsePrivacyHardened(true);
+          console.log('[Payment] ✓ Using COMPRESSED mode (shielded balance sufficient)');
+        } else if (previousCompressedUsdc >= paymentAmount && compressedUsdc === 0) {
+          // User SHOULD have enough shielded but fetch failed - use previous value
+          console.warn('[Payment] Using PREVIOUS compressed balance since fetch returned 0');
+          setHasCompressedFunds(true);
+          setUsePrivacyHardened(true);
+        } else {
+          setHasCompressedFunds(false);
+          setUsePrivacyHardened(false);
+          console.log('[Payment] Using STANDARD mode (no shielded balance)');
+        }
         
         setShowPaymentConfirmModal(true);
       } else {
@@ -593,13 +629,23 @@ export default function StealthPayment({
       }
     } catch (err: any) {
       console.error('[Payment] Balance refresh failed:', err);
-      // Fall back to existing pool data
-      const compressedUsdc = (pool.balance as any)?.compressedUsdc || 0;
+      
+      // ═══════════════════════════════════════════════════════════════════════════
+      // CRITICAL: On error, use PREVIOUS balance - don't downgrade!
+      // ═══════════════════════════════════════════════════════════════════════════
+      const compressedUsdc = previousCompressedUsdc;
       const paymentAmount = parseFloat(inputAmount);
       const hasEnoughShielded = compressedUsdc >= paymentAmount;
       
-      setHasCompressedFunds(hasEnoughShielded);
-      setUsePrivacyHardened(hasEnoughShielded);
+      if (hasEnoughShielded) {
+        console.log('[Payment] Balance refresh failed, using PREVIOUS shielded balance:', compressedUsdc);
+        setHasCompressedFunds(true);
+        setUsePrivacyHardened(true);
+      } else {
+        setHasCompressedFunds(false);
+        setUsePrivacyHardened(false);
+      }
+      
       setShowPaymentConfirmModal(true);
     }
   };

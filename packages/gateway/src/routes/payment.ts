@@ -2848,6 +2848,39 @@ router.post('/pool/pay', async (req: Request, res: Response) => {
       });
     }
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CRITICAL FIX: For compressed payments, FORCE health check FIRST
+    // Don't proceed with stale compression state - fail fast!
+    // ═══════════════════════════════════════════════════════════════════════════
+    if (useCompressed) {
+      const { forceHealthCheck } = await import('../light/client.js');
+      console.log('[Pool] Compressed payment requested - forcing Light Protocol health check...');
+      const health = await forceHealthCheck();
+      
+      if (!health.healthy) {
+        console.error('[Pool] ════════════════════════════════════════════════════════════');
+        console.error('[Pool] LIGHT PROTOCOL NOT HEALTHY - Cannot process compressed payment!');
+        console.error('[Pool] Error:', health.error);
+        console.error('[Pool] Hint:', health.hint);
+        console.error('[Pool] ════════════════════════════════════════════════════════════');
+        
+        return res.status(503).json({
+          success: false,
+          error: 'Light Protocol unavailable for compressed payments',
+          errorCode: 'LIGHT_UNAVAILABLE',
+          details: {
+            error: health.error,
+            hint: health.hint,
+            rpcUrl: health.rpcUrl,
+          },
+          message: 'Compressed payments temporarily unavailable. Please try again or use standard payment.',
+          timestamp: Date.now(),
+        });
+      }
+      
+      console.log('[Pool] ✓ Light Protocol healthy, proceeding with compressed payment');
+    }
+    
     // Check pool has enough balance
     const connection = getSolanaConnection();
     const balance = await getPoolBalance(connection, pool.id);

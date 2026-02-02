@@ -471,6 +471,7 @@ export async function createCompressedBurner(
 
 /**
  * Get compressed token balance for an account
+ * Returns { amount, error } to distinguish between "no balance" and "fetch failed"
  */
 export async function getCompressedBalance(
   ownerPubkey: PublicKey,
@@ -478,11 +479,27 @@ export async function getCompressedBalance(
 ): Promise<CompressedTokenBalance | null> {
   // IMPORTANT: Initialize connection FIRST, then check compressionSupported
   // The flag is only set during initialization!
-  const connection = await initLightConnection();
+  let connection = await initLightConnection();
   
+  // CRITICAL FIX: If compressionSupported is false, try ONCE MORE to reinitialize
+  // This handles cases where the first init failed due to temporary network issues
   if (!compressionSupported) {
-    console.warn('[Light] Compression not available - cannot get compressed balance');
-    return null;
+    console.warn('[Light] Compression not supported on first check, attempting re-initialization...');
+    
+    // Force re-initialization
+    initialized = false;
+    lightConnection = null;
+    connection = await initLightConnection();
+    
+    if (!compressionSupported) {
+      console.error('[Light] ════════════════════════════════════════════════════════════');
+      console.error('[Light] CRITICAL: Compression STILL not available after retry!');
+      console.error('[Light] LIGHT_RPC_URL:', LIGHT_RPC_URL ? LIGHT_RPC_URL.slice(0, 50) + '...' : 'NOT SET');
+      console.error('[Light] This will cause shielded payments to FAIL!');
+      console.error('[Light] ════════════════════════════════════════════════════════════');
+      return null;
+    }
+    console.log('[Light] ✓ Re-initialization successful, compression now available');
   }
   
   console.log(`[Light] Getting compressed balance for: ${ownerPubkey.toBase58().slice(0, 8)}...`);
@@ -493,7 +510,7 @@ export async function getCompressedBalance(
     });
     
     if (!compressedAccounts || compressedAccounts.items.length === 0) {
-      console.log('[Light] No compressed token accounts found');
+      console.log('[Light] No compressed token accounts found (balance is 0)');
       return null;
     }
     
@@ -502,7 +519,8 @@ export async function getCompressedBalance(
       totalAmount += BigInt(account.parsed.amount.toString());
     }
     
-    console.log(`[Light] ✓ Compressed balance: ${Number(totalAmount) / 10 ** USDC_DECIMALS} USDC`);
+    const balanceUsdc = Number(totalAmount) / 10 ** USDC_DECIMALS;
+    console.log(`[Light] ✓ Compressed balance: ${balanceUsdc.toFixed(6)} USDC`);
     
     return {
       mint,
@@ -510,7 +528,11 @@ export async function getCompressedBalance(
       amount: totalAmount,
     };
   } catch (error: any) {
-    console.error('[Light] Failed to get compressed balance:', error.message);
+    console.error('[Light] ════════════════════════════════════════════════════════════');
+    console.error('[Light] FAILED to get compressed balance:', error.message);
+    console.error('[Light] Owner:', ownerPubkey.toBase58());
+    console.error('[Light] This may cause payment validation to fail!');
+    console.error('[Light] ════════════════════════════════════════════════════════════');
     return null;
   }
 }

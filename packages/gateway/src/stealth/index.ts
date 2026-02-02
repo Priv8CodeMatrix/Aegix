@@ -1274,17 +1274,29 @@ export async function executePoolPayment(
   }
 }
 
+// Cache for last known compressed balances (keyed by pool address)
+const compressedBalanceCache = new Map<string, { balance: number; timestamp: number }>();
+const BALANCE_CACHE_TTL = 60000; // 1 minute TTL
+
 /**
  * Get pool wallet balance (including compressed/shielded balance)
+ * CRITICAL: Returns compressedUsdcError if fetch failed, so frontend knows to warn user
  */
 export async function getPoolBalance(
   connection: Connection,
   poolId: string
-): Promise<{ sol: number; usdc: number; compressedUsdc: number } | null> {
+): Promise<{ 
+  sol: number; 
+  usdc: number; 
+  compressedUsdc: number; 
+  compressedUsdcError?: string;
+  compressedUsdcFromCache?: boolean;
+} | null> {
   const pool = poolRegistry.get(poolId);
   if (!pool) return null;
   
   const poolPubkey = new PublicKey(pool.publicKey);
+  const poolAddress = pool.publicKey;
   
   // Get SOL balance
   const solBalance = await connection.getBalance(poolPubkey, 'confirmed');
@@ -1303,27 +1315,62 @@ export async function getPoolBalance(
   
   // Get compressed/shielded USDC balance (Light Protocol)
   let compressedUsdcBalance = 0;
+  let compressedUsdcError: string | undefined;
+  let compressedUsdcFromCache = false;
+  
   try {
     const { getCompressedBalance } = await import('../light/client.js');
     const compressedBalance = await getCompressedBalance(poolPubkey, USDC_MINT);
+    
     if (compressedBalance && compressedBalance.amount) {
       compressedUsdcBalance = Number(compressedBalance.amount) / 1_000_000;
-      console.log(`[Pool] ✓ Compressed USDC balance for ${poolId.slice(0, 8)}...: ${compressedUsdcBalance}`);
+      console.log(`[Pool] ✓ Compressed USDC balance for ${poolId.slice(0, 8)}...: ${compressedUsdcBalance.toFixed(6)}`);
+      
+      // Update cache with fresh value
+      compressedBalanceCache.set(poolAddress, { 
+        balance: compressedUsdcBalance, 
+        timestamp: Date.now() 
+      });
     } else {
-      console.log(`[Pool] No compressed USDC for ${poolId.slice(0, 8)}... (balance object: ${JSON.stringify(compressedBalance)})`);
+      // No compressed accounts found - this is valid (balance is 0)
+      console.log(`[Pool] No compressed USDC for ${poolId.slice(0, 8)}... (this is OK if user hasn't shielded)`);
+      compressedBalanceCache.set(poolAddress, { balance: 0, timestamp: Date.now() });
     }
   } catch (err: any) {
-    // Light Protocol not available or no compressed balance
-    console.log(`[Pool] Could not fetch compressed balance for ${poolId.slice(0, 8)}...: ${err.message}`);
+    // CRITICAL: Light Protocol fetch FAILED - use cache if available
+    console.error(`[Pool] ════════════════════════════════════════════════════════════`);
+    console.error(`[Pool] FAILED to fetch compressed balance: ${err.message}`);
+    
+    // Check cache
+    const cached = compressedBalanceCache.get(poolAddress);
+    if (cached && Date.now() - cached.timestamp < BALANCE_CACHE_TTL) {
+      compressedUsdcBalance = cached.balance;
+      compressedUsdcFromCache = true;
+      compressedUsdcError = `Using cached balance (${((Date.now() - cached.timestamp) / 1000).toFixed(0)}s old): ${err.message}`;
+      console.log(`[Pool] Using CACHED compressed balance: ${compressedUsdcBalance.toFixed(6)} USDC`);
+    } else if (cached) {
+      // Cache exists but stale - still use it but warn
+      compressedUsdcBalance = cached.balance;
+      compressedUsdcFromCache = true;
+      compressedUsdcError = `Using stale cached balance (${((Date.now() - cached.timestamp) / 1000).toFixed(0)}s old): ${err.message}`;
+      console.warn(`[Pool] Using STALE cached compressed balance: ${compressedUsdcBalance.toFixed(6)} USDC`);
+    } else {
+      // No cache - this is a problem!
+      compressedUsdcError = `Light Protocol unavailable and no cached balance: ${err.message}`;
+      console.error(`[Pool] NO CACHE available - returning 0 compressed balance!`);
+    }
+    console.error(`[Pool] ════════════════════════════════════════════════════════════`);
   }
   
   const result = {
     sol: solBalance / LAMPORTS_PER_SOL,
     usdc: usdcBalance,
     compressedUsdc: compressedUsdcBalance,
+    compressedUsdcError,
+    compressedUsdcFromCache,
   };
   
-  console.log(`[Pool] Balance for ${poolId.slice(0, 8)}...: SOL=${result.sol.toFixed(4)}, USDC=${result.usdc.toFixed(2)}, CompressedUSDC=${result.compressedUsdc.toFixed(4)}`);
+  console.log(`[Pool] Balance for ${poolId.slice(0, 8)}...: SOL=${result.sol.toFixed(4)}, USDC=${result.usdc.toFixed(2)}, CompressedUSDC=${result.compressedUsdc.toFixed(4)}${compressedUsdcFromCache ? ' (CACHED)' : ''}`);
   
   return result;
 }
