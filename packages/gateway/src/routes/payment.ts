@@ -1633,13 +1633,34 @@ router.post('/pool/shield', async (req: Request, res: Response) => {
     
     console.log('[Shield] ✓ Transaction confirmed!');
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CRITICAL: Update shielded balance override cache IMMEDIATELY
+    // This cache is TRUSTED for 5 minutes and takes priority over unreliable RPC
+    // ═══════════════════════════════════════════════════════════════════════════
+    const { setShieldedOverride, addToShieldedOverride, getShieldedOverride } = await import('../cache/shielded-balance.js');
+    
+    const existingOverride = getShieldedOverride(poolAddress);
+    if (existingOverride) {
+      // Add to existing shielded amount (user shielding more funds)
+      addToShieldedOverride(poolAddress, amountToShield, poolId);
+      console.log(`[Shield] Updated shieldedBalanceOverride: ${(existingOverride.amount + amountToShield).toFixed(6)} USDC`);
+    } else {
+      // First shield - set the override
+      setShieldedOverride(poolAddress, amountToShield, poolId, 'shield_tx');
+      console.log(`[Shield] Set shieldedBalanceOverride: ${amountToShield.toFixed(6)} USDC`);
+    }
+    
     // 6. Wait a moment for indexing, then check new compressed balance
     await new Promise(resolve => setTimeout(resolve, 2000));
     
     const newCompressedBalance = await getCompressedBalance(poolPubkey, usdcMint);
-    const newCompressedAmount = newCompressedBalance ? Number(newCompressedBalance.amount) / 10 ** 6 : amountToShield;
+    // TRUST the override amount, not the RPC result (RPC is unreliable)
+    const overrideAfterShield = getShieldedOverride(poolAddress);
+    const newCompressedAmount = overrideAfterShield?.amount || 
+      (newCompressedBalance ? Number(newCompressedBalance.amount) / 10 ** 6 : amountToShield);
     
     console.log('[Shield] ✓ Shield complete! New compressed balance:', newCompressedAmount);
+    console.log('[Shield]   Source: shielded override cache (trusted)');
     
     return res.json({
       success: true,
@@ -2895,8 +2916,26 @@ router.post('/pool/pay', async (req: Request, res: Response) => {
     
     if (useCompressed) {
       // COMPRESSED PAYMENT: Validate shielded USDC and Recovery Pool SOL
-      const haveShieldedUsdc = balance?.compressedUsdc || 0;
+      let haveShieldedUsdc = balance?.compressedUsdc || 0;
       const requiredSolForCompressed = 0.001; // Minimal SOL needed for compressed tx
+      
+      // ═══════════════════════════════════════════════════════════════════════════
+      // CRITICAL FIX: Check shielded balance override if RPC balance is 0
+      // The shielded override cache is TRUSTED because it's set after successful shield TX
+      // ═══════════════════════════════════════════════════════════════════════════
+      const { getShieldedOverride, subtractFromShieldedOverride } = await import('../cache/shielded-balance.js');
+      const shieldedOverride = getShieldedOverride(pool.publicKey);
+      
+      if (haveShieldedUsdc === 0 && shieldedOverride) {
+        console.log(`[Pool] ════════════════════════════════════════════════════════════`);
+        console.log(`[Pool] RPC returned 0 shielded USDC but OVERRIDE exists!`);
+        console.log(`[Pool] Using SHIELDED OVERRIDE: ${shieldedOverride.amount.toFixed(6)} USDC`);
+        console.log(`[Pool] Override age: ${((Date.now() - shieldedOverride.timestamp) / 1000).toFixed(0)}s`);
+        console.log(`[Pool] ════════════════════════════════════════════════════════════`);
+        haveShieldedUsdc = shieldedOverride.amount;
+      } else if (haveShieldedUsdc > 0) {
+        console.log(`[Pool] Using RPC shielded balance: ${haveShieldedUsdc.toFixed(6)} USDC`);
+      }
       
       // ═══════════════════════════════════════════════════════════════════════════
       // CRITICAL FIX: Get Recovery Pool address from MULTIPLE sources (reliability)
@@ -2930,7 +2969,7 @@ router.post('/pool/pay', async (req: Request, res: Response) => {
       const needMoreRecoverySol = haveRecoverySol < requiredSolForCompressed;
       const noRecoveryPool = !recoveryPoolAddress;
       
-      console.log(`[Pool] Compressed validation: ShieldedUSDC=${haveShieldedUsdc.toFixed(4)}, Required=${requiredUsdc}, RecoverySol=${haveRecoverySol.toFixed(4)}, HasRecoveryPool=${!!recoveryPoolAddress}`);
+      console.log(`[Pool] Compressed validation: ShieldedUSDC=${haveShieldedUsdc.toFixed(4)} (${shieldedOverride ? 'override' : 'rpc'}), Required=${requiredUsdc}, RecoverySol=${haveRecoverySol.toFixed(4)}, HasRecoveryPool=${!!recoveryPoolAddress}`);
       
       if (noRecoveryPool) {
         return res.status(400).json({

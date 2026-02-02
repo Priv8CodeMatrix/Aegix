@@ -1291,6 +1291,7 @@ export async function getPoolBalance(
   compressedUsdc: number; 
   compressedUsdcError?: string;
   compressedUsdcFromCache?: boolean;
+  compressedUsdcSource?: 'rpc' | 'shield_override' | 'stale_override' | 'override_on_error' | 'cache' | 'stale_cache' | 'none';
 } | null> {
   const pool = poolRegistry.get(poolId);
   if (!pool) return null;
@@ -1313,53 +1314,104 @@ export async function getPoolBalance(
     // No USDC account
   }
   
-  // Get compressed/shielded USDC balance (Light Protocol)
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Get compressed/shielded USDC balance
+  // PRIORITY ORDER:
+  // 1. Shielded balance override (trusted after recent shield transaction)
+  // 2. RPC call to Light Protocol
+  // 3. Local cache (fallback when RPC fails)
+  // ═══════════════════════════════════════════════════════════════════════════
   let compressedUsdcBalance = 0;
   let compressedUsdcError: string | undefined;
   let compressedUsdcFromCache = false;
+  let compressedUsdcSource: 'rpc' | 'shield_override' | 'stale_override' | 'override_on_error' | 'cache' | 'stale_cache' | 'none' = 'none';
   
-  try {
-    const { getCompressedBalance } = await import('../light/client.js');
-    const compressedBalance = await getCompressedBalance(poolPubkey, USDC_MINT);
-    
-    if (compressedBalance && compressedBalance.amount) {
-      compressedUsdcBalance = Number(compressedBalance.amount) / 1_000_000;
-      console.log(`[Pool] ✓ Compressed USDC balance for ${poolId.slice(0, 8)}...: ${compressedUsdcBalance.toFixed(6)}`);
+  // PRIORITY 1: Check shielded balance override (TRUSTED after recent shield)
+  const { getShieldedOverride, isOverrideValid, confirmShieldedBalance } = await import('../cache/shielded-balance.js');
+  const shieldedOverride = getShieldedOverride(poolAddress);
+  
+  if (shieldedOverride && isOverrideValid(poolAddress)) {
+    // Override is fresh (< 5 minutes) - TRUST IT over RPC
+    compressedUsdcBalance = shieldedOverride.amount;
+    compressedUsdcSource = 'shield_override';
+    console.log(`[Pool] ════════════════════════════════════════════════════════════`);
+    console.log(`[Pool] Using SHIELDED OVERRIDE (trusted): ${compressedUsdcBalance.toFixed(6)} USDC`);
+    console.log(`[Pool]   Age: ${((Date.now() - shieldedOverride.timestamp) / 1000).toFixed(0)}s`);
+    console.log(`[Pool]   Source: ${shieldedOverride.source}`);
+    console.log(`[Pool] ════════════════════════════════════════════════════════════`);
+  } else {
+    // PRIORITY 2: Try RPC
+    try {
+      const { getCompressedBalance } = await import('../light/client.js');
+      const compressedBalance = await getCompressedBalance(poolPubkey, USDC_MINT);
       
-      // Update cache with fresh value
-      compressedBalanceCache.set(poolAddress, { 
-        balance: compressedUsdcBalance, 
-        timestamp: Date.now() 
-      });
-    } else {
-      // No compressed accounts found - this is valid (balance is 0)
-      console.log(`[Pool] No compressed USDC for ${poolId.slice(0, 8)}... (this is OK if user hasn't shielded)`);
-      compressedBalanceCache.set(poolAddress, { balance: 0, timestamp: Date.now() });
+      if (compressedBalance && compressedBalance.amount) {
+        compressedUsdcBalance = Number(compressedBalance.amount) / 1_000_000;
+        compressedUsdcSource = 'rpc';
+        console.log(`[Pool] ✓ Compressed USDC from RPC for ${poolId.slice(0, 8)}...: ${compressedUsdcBalance.toFixed(6)}`);
+        
+        // Update both caches with fresh value
+        compressedBalanceCache.set(poolAddress, { 
+          balance: compressedUsdcBalance, 
+          timestamp: Date.now() 
+        });
+        
+        // Also update shielded override if RPC shows balance
+        confirmShieldedBalance(poolAddress, compressedUsdcBalance, poolId);
+      } else {
+        // RPC returned empty/null - check if we have a stale override
+        if (shieldedOverride) {
+          // RPC says 0 but we have an override (even stale) - TRUST THE OVERRIDE
+          compressedUsdcBalance = shieldedOverride.amount;
+          compressedUsdcSource = 'stale_override';
+          compressedUsdcError = `RPC returned 0 but using stale override (${((Date.now() - shieldedOverride.timestamp) / 1000).toFixed(0)}s old)`;
+          console.warn(`[Pool] ════════════════════════════════════════════════════════════`);
+          console.warn(`[Pool] RPC returned 0 but override exists!`);
+          console.warn(`[Pool] Using STALE OVERRIDE: ${compressedUsdcBalance.toFixed(6)} USDC`);
+          console.warn(`[Pool] ════════════════════════════════════════════════════════════`);
+        } else {
+          // No override, RPC says 0 - user hasn't shielded
+          console.log(`[Pool] No compressed USDC for ${poolId.slice(0, 8)}... (user hasn't shielded)`);
+          compressedBalanceCache.set(poolAddress, { balance: 0, timestamp: Date.now() });
+        }
+      }
+    } catch (err: any) {
+      // RPC FAILED - check overrides and caches
+      console.error(`[Pool] ════════════════════════════════════════════════════════════`);
+      console.error(`[Pool] FAILED to fetch compressed balance via RPC: ${err.message}`);
+      
+      // PRIORITY 3: Use shielded override even if stale (on RPC error)
+      if (shieldedOverride) {
+        compressedUsdcBalance = shieldedOverride.amount;
+        compressedUsdcSource = 'override_on_error';
+        compressedUsdcFromCache = true;
+        compressedUsdcError = `RPC failed, using shielded override (${((Date.now() - shieldedOverride.timestamp) / 1000).toFixed(0)}s old): ${err.message}`;
+        console.log(`[Pool] Using SHIELDED OVERRIDE on error: ${compressedUsdcBalance.toFixed(6)} USDC`);
+      } else {
+        // PRIORITY 4: Check local cache
+        const cached = compressedBalanceCache.get(poolAddress);
+        if (cached && Date.now() - cached.timestamp < BALANCE_CACHE_TTL) {
+          compressedUsdcBalance = cached.balance;
+          compressedUsdcFromCache = true;
+          compressedUsdcSource = 'cache';
+          compressedUsdcError = `Using cached balance (${((Date.now() - cached.timestamp) / 1000).toFixed(0)}s old): ${err.message}`;
+          console.log(`[Pool] Using CACHED compressed balance: ${compressedUsdcBalance.toFixed(6)} USDC`);
+        } else if (cached) {
+          // Cache exists but stale - still use it
+          compressedUsdcBalance = cached.balance;
+          compressedUsdcFromCache = true;
+          compressedUsdcSource = 'stale_cache';
+          compressedUsdcError = `Using stale cached balance (${((Date.now() - cached.timestamp) / 1000).toFixed(0)}s old): ${err.message}`;
+          console.warn(`[Pool] Using STALE cached compressed balance: ${compressedUsdcBalance.toFixed(6)} USDC`);
+        } else {
+          // No cache, no override - this is a problem!
+          compressedUsdcSource = 'none';
+          compressedUsdcError = `Light Protocol unavailable and no cached balance: ${err.message}`;
+          console.error(`[Pool] NO CACHE OR OVERRIDE available - returning 0!`);
+        }
+      }
+      console.error(`[Pool] ════════════════════════════════════════════════════════════`);
     }
-  } catch (err: any) {
-    // CRITICAL: Light Protocol fetch FAILED - use cache if available
-    console.error(`[Pool] ════════════════════════════════════════════════════════════`);
-    console.error(`[Pool] FAILED to fetch compressed balance: ${err.message}`);
-    
-    // Check cache
-    const cached = compressedBalanceCache.get(poolAddress);
-    if (cached && Date.now() - cached.timestamp < BALANCE_CACHE_TTL) {
-      compressedUsdcBalance = cached.balance;
-      compressedUsdcFromCache = true;
-      compressedUsdcError = `Using cached balance (${((Date.now() - cached.timestamp) / 1000).toFixed(0)}s old): ${err.message}`;
-      console.log(`[Pool] Using CACHED compressed balance: ${compressedUsdcBalance.toFixed(6)} USDC`);
-    } else if (cached) {
-      // Cache exists but stale - still use it but warn
-      compressedUsdcBalance = cached.balance;
-      compressedUsdcFromCache = true;
-      compressedUsdcError = `Using stale cached balance (${((Date.now() - cached.timestamp) / 1000).toFixed(0)}s old): ${err.message}`;
-      console.warn(`[Pool] Using STALE cached compressed balance: ${compressedUsdcBalance.toFixed(6)} USDC`);
-    } else {
-      // No cache - this is a problem!
-      compressedUsdcError = `Light Protocol unavailable and no cached balance: ${err.message}`;
-      console.error(`[Pool] NO CACHE available - returning 0 compressed balance!`);
-    }
-    console.error(`[Pool] ════════════════════════════════════════════════════════════`);
   }
   
   const result = {
@@ -1368,9 +1420,10 @@ export async function getPoolBalance(
     compressedUsdc: compressedUsdcBalance,
     compressedUsdcError,
     compressedUsdcFromCache,
+    compressedUsdcSource,
   };
   
-  console.log(`[Pool] Balance for ${poolId.slice(0, 8)}...: SOL=${result.sol.toFixed(4)}, USDC=${result.usdc.toFixed(2)}, CompressedUSDC=${result.compressedUsdc.toFixed(4)}${compressedUsdcFromCache ? ' (CACHED)' : ''}`);
+  console.log(`[Pool] Balance for ${poolId.slice(0, 8)}...: SOL=${result.sol.toFixed(4)}, USDC=${result.usdc.toFixed(2)}, CompressedUSDC=${result.compressedUsdc.toFixed(4)} (source: ${compressedUsdcSource})`);
   
   return result;
 }

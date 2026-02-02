@@ -477,6 +477,10 @@ export async function getCompressedBalance(
   ownerPubkey: PublicKey,
   mint: PublicKey = USDC_MINT
 ): Promise<CompressedTokenBalance | null> {
+  // Retry configuration
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY = 1000; // 1 second
+  
   // IMPORTANT: Initialize connection FIRST, then check compressionSupported
   // The flag is only set during initialization!
   let connection = await initLightConnection();
@@ -502,39 +506,70 @@ export async function getCompressedBalance(
     console.log('[Light] ✓ Re-initialization successful, compression now available');
   }
   
-  console.log(`[Light] Getting compressed balance for: ${ownerPubkey.toBase58().slice(0, 8)}...`);
+  const ownerAddress = ownerPubkey.toBase58();
+  console.log(`[Light] ════════════════════════════════════════════════════════════`);
+  console.log(`[Light] Getting compressed balance for: ${ownerAddress.slice(0, 12)}...`);
+  console.log(`[Light] RPC URL: ${LIGHT_RPC_URL?.slice(0, 50) || 'NOT SET'}...`);
+  console.log(`[Light] Max retries: ${MAX_RETRIES}`);
   
-  try {
-    const compressedAccounts = await connection.getCompressedTokenAccountsByOwner(ownerPubkey, {
-      mint,
-    });
-    
-    if (!compressedAccounts || compressedAccounts.items.length === 0) {
-      console.log('[Light] No compressed token accounts found (balance is 0)');
-      return null;
+  // Retry loop
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      console.log(`[Light] Attempt ${attempt}/${MAX_RETRIES}: Fetching compressed accounts...`);
+      
+      const compressedAccounts = await connection.getCompressedTokenAccountsByOwner(ownerPubkey, {
+        mint,
+      });
+      
+      // Log full response for debugging
+      console.log(`[Light] RPC Response: hasItems=${!!compressedAccounts?.items}, itemCount=${compressedAccounts?.items?.length || 0}`);
+      
+      if (compressedAccounts && compressedAccounts.items && compressedAccounts.items.length > 0) {
+        // SUCCESS - Found compressed accounts
+        let totalAmount = BigInt(0);
+        for (const account of compressedAccounts.items) {
+          totalAmount += BigInt(account.parsed.amount.toString());
+        }
+        
+        const balanceUsdc = Number(totalAmount) / 10 ** USDC_DECIMALS;
+        console.log(`[Light] ✓ Compressed balance found: ${balanceUsdc.toFixed(6)} USDC (${compressedAccounts.items.length} account(s))`);
+        console.log(`[Light] ════════════════════════════════════════════════════════════`);
+        
+        return {
+          mint,
+          owner: ownerPubkey,
+          amount: totalAmount,
+        };
+      }
+      
+      // Empty result - might be temporary, retry
+      if (attempt < MAX_RETRIES) {
+        console.log(`[Light] Attempt ${attempt}: Empty result, waiting ${RETRY_DELAY}ms before retry...`);
+        await new Promise(r => setTimeout(r, RETRY_DELAY));
+      }
+      
+    } catch (error: any) {
+      console.error(`[Light] Attempt ${attempt} failed: ${error.message}`);
+      
+      if (attempt < MAX_RETRIES) {
+        console.log(`[Light] Waiting ${RETRY_DELAY}ms before retry...`);
+        await new Promise(r => setTimeout(r, RETRY_DELAY));
+      } else {
+        // All retries failed - throw to let caller handle
+        console.error('[Light] ════════════════════════════════════════════════════════════');
+        console.error('[Light] ALL RETRIES FAILED to get compressed balance');
+        console.error('[Light] Owner:', ownerAddress);
+        console.error('[Light] Error:', error.message);
+        console.error('[Light] ════════════════════════════════════════════════════════════');
+        throw error;
+      }
     }
-    
-    let totalAmount = BigInt(0);
-    for (const account of compressedAccounts.items) {
-      totalAmount += BigInt(account.parsed.amount.toString());
-    }
-    
-    const balanceUsdc = Number(totalAmount) / 10 ** USDC_DECIMALS;
-    console.log(`[Light] ✓ Compressed balance: ${balanceUsdc.toFixed(6)} USDC`);
-    
-    return {
-      mint,
-      owner: ownerPubkey,
-      amount: totalAmount,
-    };
-  } catch (error: any) {
-    console.error('[Light] ════════════════════════════════════════════════════════════');
-    console.error('[Light] FAILED to get compressed balance:', error.message);
-    console.error('[Light] Owner:', ownerPubkey.toBase58());
-    console.error('[Light] This may cause payment validation to fail!');
-    console.error('[Light] ════════════════════════════════════════════════════════════');
-    return null;
   }
+  
+  // All retries returned empty - balance is genuinely 0
+  console.log(`[Light] All ${MAX_RETRIES} attempts returned empty - no compressed balance`);
+  console.log(`[Light] ════════════════════════════════════════════════════════════`);
+  return null;
 }
 
 // =============================================================================

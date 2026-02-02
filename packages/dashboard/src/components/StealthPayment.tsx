@@ -141,6 +141,14 @@ export default function StealthPayment({
   const [usePrivacyHardened, setUsePrivacyHardened] = useState(false);
   const [hasCompressedFunds, setHasCompressedFunds] = useState(false);
   
+  // ═══════════════════════════════════════════════════════════════════════════
+  // LOCAL SHIELDED BALANCE TRACKING
+  // This is TRUSTED because we set it after successful shield transactions
+  // If server returns 0 but we have local knowledge, trust the local value
+  // ═══════════════════════════════════════════════════════════════════════════
+  const [lastKnownShieldedAmount, setLastKnownShieldedAmount] = useState<number>(0);
+  const [shieldedTimestamp, setShieldedTimestamp] = useState<number>(0);
+  
   // Refresh state
   const [isRefreshing, setIsRefreshing] = useState(false);
   
@@ -321,6 +329,16 @@ export default function StealthPayment({
       setShieldAmount('');
       setHasCompressedFunds(true);
       
+      // ═══════════════════════════════════════════════════════════════════════════
+      // CRITICAL: Store locally shielded amount - TRUST THIS for 5 minutes
+      // This is used if server balance checks return 0 due to RPC issues
+      // ═══════════════════════════════════════════════════════════════════════════
+      const compressedBalance = result.data?.compression?.compressedBalance || amount;
+      const newShieldedTotal = lastKnownShieldedAmount + amount;
+      setLastKnownShieldedAmount(newShieldedTotal);
+      setShieldedTimestamp(Date.now());
+      console.log(`[Shield] Updated local shielded tracking: ${newShieldedTotal.toFixed(6)} USDC`);
+      
       // Refresh balances
       console.log('[Shield] Refreshing balances...');
       setTimeout(async () => {
@@ -330,7 +348,6 @@ export default function StealthPayment({
       }, 1000);
       
       // Show success message
-      const compressedBalance = result.data?.compression?.compressedBalance || amount;
       alert(`✅ Successfully shielded ${amount} USDC!\n\n${result.data?.message || 'Your funds are now compressed and ready for Maximum Privacy payments (~50x cheaper).'}\n\nTransaction: ${signature.slice(0, 20)}...`);
       
     } catch (err: any) {
@@ -542,6 +559,21 @@ export default function StealthPayment({
     // Remember previous compressed balance for comparison
     const previousCompressedUsdc = (pool.balance as any)?.compressedUsdc || 0;
     
+    // ═══════════════════════════════════════════════════════════════════════════
+    // CHECK LOCAL SHIELDED KNOWLEDGE
+    // If we recently shielded funds, trust our local knowledge even if server returns 0
+    // ═══════════════════════════════════════════════════════════════════════════
+    const localShieldedValid = lastKnownShieldedAmount > 0 && 
+      (Date.now() - shieldedTimestamp) < 5 * 60 * 1000; // 5 minutes
+    
+    if (localShieldedValid) {
+      console.log('[Payment] ════════════════════════════════════════════════════════════');
+      console.log('[Payment] LOCAL SHIELDED KNOWLEDGE AVAILABLE:');
+      console.log('[Payment]   Amount: ', lastKnownShieldedAmount.toFixed(6), 'USDC');
+      console.log('[Payment]   Age: ', ((Date.now() - shieldedTimestamp) / 1000).toFixed(0), 's');
+      console.log('[Payment] ════════════════════════════════════════════════════════════');
+    }
+    
     // CRITICAL: Refresh balance BEFORE checking - ensures we have latest compressed balance
     console.log('[Payment] Refreshing balance before payment check...');
     console.log('[Payment] Previous compressed balance:', previousCompressedUsdc);
@@ -551,15 +583,28 @@ export default function StealthPayment({
       const result = await response.json();
       if (result.success && result.data.balance) {
         const freshBalance = result.data.balance;
-        console.log('[Payment] Fresh balance:', freshBalance);
+        console.log('[Payment] Fresh balance from server:', freshBalance);
         
         // CRITICAL: Check for compressed balance fetch errors
         if (freshBalance.compressedUsdcError) {
           console.warn('[Payment] Compressed balance fetch had issues:', freshBalance.compressedUsdcError);
         }
         
-        // Use fresh balance for checks
-        const compressedUsdc = freshBalance.compressedUsdc || 0;
+        // ═══════════════════════════════════════════════════════════════════════════
+        // USE LOCAL KNOWLEDGE IF SERVER RETURNS 0 BUT WE KNOW USER HAS SHIELDED FUNDS
+        // ═══════════════════════════════════════════════════════════════════════════
+        const serverCompressedUsdc = freshBalance.compressedUsdc || 0;
+        let effectiveCompressedUsdc = serverCompressedUsdc;
+        
+        if (serverCompressedUsdc === 0 && localShieldedValid) {
+          console.warn('[Payment] ════════════════════════════════════════════════════════════');
+          console.warn('[Payment] SERVER RETURNED 0 BUT WE HAVE LOCAL SHIELD RECORD!');
+          console.warn('[Payment] Using LOCAL knowledge: ', lastKnownShieldedAmount.toFixed(6), 'USDC');
+          console.warn('[Payment] ════════════════════════════════════════════════════════════');
+          effectiveCompressedUsdc = lastKnownShieldedAmount;
+        }
+        
+        const compressedUsdc = effectiveCompressedUsdc;
         const regularUsdc = freshBalance.usdc || 0;
         const paymentAmount = parseFloat(inputAmount);
         const hasEnoughShielded = compressedUsdc >= paymentAmount;
@@ -567,29 +612,38 @@ export default function StealthPayment({
         const hasSomeShielded = compressedUsdc > 0;
         
         console.log('[Payment] Checking balances:', { 
-          compressedUsdc, 
+          serverCompressedUsdc,
+          effectiveCompressedUsdc: compressedUsdc,
+          localKnowledge: localShieldedValid ? lastKnownShieldedAmount : 'none',
           regularUsdc, 
           paymentAmount, 
           hasEnoughShielded, 
           hasEnoughRegular,
           hasSomeShielded,
+          source: freshBalance.compressedUsdcSource,
           fromCache: freshBalance.compressedUsdcFromCache,
           error: freshBalance.compressedUsdcError
         });
         
         // ═══════════════════════════════════════════════════════════════════════════
         // CRITICAL FIX: Don't silently downgrade if compressed balance suddenly dropped
-        // If user PREVIOUSLY had shielded funds but now shows 0, warn them!
+        // UNLESS we have local knowledge that says otherwise
         // ═══════════════════════════════════════════════════════════════════════════
-        if (previousCompressedUsdc > 0 && compressedUsdc === 0 && !freshBalance.compressedUsdcFromCache) {
+        if (previousCompressedUsdc > 0 && serverCompressedUsdc === 0 && !localShieldedValid && !freshBalance.compressedUsdcFromCache) {
           console.error('[Payment] ⚠️ Compressed balance dropped from', previousCompressedUsdc, 'to 0!');
           setError(`Shielded balance check failed! You had ${previousCompressedUsdc.toFixed(4)} shielded USDC but fetch returned 0. This may be a temporary RPC issue. Click "Refresh" and try again.`);
           // Keep previous balance in UI so user doesn't panic
           return;
         }
         
-        // Update pool state with fresh balance
-        setPool(prev => prev ? { ...prev, balance: freshBalance } : null);
+        // Update pool state - but use effective compressed balance that includes local knowledge
+        setPool(prev => prev ? { 
+          ...prev, 
+          balance: {
+            ...freshBalance,
+            compressedUsdc: effectiveCompressedUsdc, // Use effective, not server value
+          } 
+        } : null);
         
         // ═══════════════════════════════════════════════════════════════════════════
         // CRITICAL FIX: If user has NO shielded funds but HAS regular USDC, prompt to shield!
