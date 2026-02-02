@@ -280,15 +280,67 @@ export function getPendingReservationsTotal(owner: string): number {
 // SIMPLE KEYPAIR STORAGE - For Recovery Pools created via create-and-fund
 // =============================================================================
 
-// Simple in-memory storage for Recovery Pool keypairs (keyed by owner wallet)
+// Simple storage for Recovery Pool keypairs (keyed by owner wallet)
 const simpleRecoveryKeypairs = new Map<string, Keypair>();
+const SIMPLE_KEYPAIRS_FILE = path.join(process.cwd(), 'data', 'recovery-keypairs.json');
+
+// Load keypairs from disk on startup
+function loadSimpleKeypairs(): void {
+  try {
+    if (fs.existsSync(SIMPLE_KEYPAIRS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(SIMPLE_KEYPAIRS_FILE, 'utf-8'));
+      if (data.keypairs) {
+        Object.entries(data.keypairs).forEach(([owner, secretKeyArray]) => {
+          try {
+            const secretKey = new Uint8Array(secretKeyArray as number[]);
+            const keypair = Keypair.fromSecretKey(secretKey);
+            simpleRecoveryKeypairs.set(owner, keypair);
+          } catch (e) {
+            console.warn(`[Recovery] Failed to restore keypair for ${owner.slice(0, 8)}...`);
+          }
+        });
+        console.log(`[Recovery] Loaded ${simpleRecoveryKeypairs.size} recovery keypair(s) from disk`);
+      }
+    }
+  } catch (e) {
+    console.warn('[Recovery] Failed to load recovery-keypairs.json');
+  }
+}
+
+// Save keypairs to disk
+function saveSimpleKeypairs(): void {
+  try {
+    const dataDir = path.join(process.cwd(), 'data');
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    
+    const keypairsObj: Record<string, number[]> = {};
+    simpleRecoveryKeypairs.forEach((keypair, owner) => {
+      keypairsObj[owner] = Array.from(keypair.secretKey);
+    });
+    
+    const data = {
+      keypairs: keypairsObj,
+      savedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(SIMPLE_KEYPAIRS_FILE, JSON.stringify(data, null, 2));
+    console.log(`[Recovery] Saved ${simpleRecoveryKeypairs.size} recovery keypair(s) to disk`);
+  } catch (e) {
+    console.error('[Recovery] Failed to save recovery-keypairs.json:', e);
+  }
+}
+
+// Load keypairs on module init
+loadSimpleKeypairs();
 
 /**
- * Store a Recovery Pool keypair for an owner (simple approach, no encryption)
- * This is used when creating Recovery Pool via the simplified create-and-fund flow
+ * Store a Recovery Pool keypair for an owner
+ * Persists to disk for reliability after redeploys
  */
 export function storeRecoveryKeypair(owner: string, keypair: Keypair): void {
   simpleRecoveryKeypairs.set(owner, keypair);
+  saveSimpleKeypairs(); // Persist immediately!
   console.log(`[Recovery] Stored keypair for ${owner.slice(0, 8)}...: ${keypair.publicKey.toBase58().slice(0, 12)}...`);
 }
 
@@ -360,9 +412,23 @@ export function setRecoveryConnection(conn: Connection): void {
 
 /**
  * Check if an owner has a Recovery Pool
+ * Checks MULTIPLE sources: old registry, simple keypairs
  */
 export function hasRecoveryPool(owner: string): boolean {
-  return ownerRecoveryIndex.has(owner);
+  // Check old registry
+  if (ownerRecoveryIndex.has(owner)) {
+    console.log(`[Recovery] hasRecoveryPool: Found in old registry for ${owner.slice(0, 8)}...`);
+    return true;
+  }
+  
+  // Check simple keypairs (new simplified flow)
+  if (simpleRecoveryKeypairs.has(owner)) {
+    console.log(`[Recovery] hasRecoveryPool: Found in simple keypairs for ${owner.slice(0, 8)}...`);
+    return true;
+  }
+  
+  console.log(`[Recovery] hasRecoveryPool: NOT found for ${owner.slice(0, 8)}... (checked: old registry, simple keypairs)`);
+  return false;
 }
 
 /**
@@ -509,11 +575,20 @@ export async function unlockRecoveryPool(ownerWallet: string, ownerSignature: st
 
 /**
  * Get the decrypted keypair for a user's Recovery Pool
+ * Checks MULTIPLE sources: simple keypairs first, then old registry
  */
 export function getRecoveryPoolKeypair(owner: string): Keypair {
+  // FIRST: Check simple keypairs storage (new simplified flow)
+  const simpleKeypair = simpleRecoveryKeypairs.get(owner);
+  if (simpleKeypair) {
+    console.log(`[Recovery] Using simple keypair for ${owner.slice(0, 8)}...`);
+    return simpleKeypair;
+  }
+  
+  // SECOND: Check old registry (backward compatibility)
   const pool = getRecoveryPoolForOwner(owner);
   if (!pool) {
-    throw new Error(`No Recovery Pool found for ${owner.slice(0, 8)}...`);
+    throw new Error(`No Recovery Pool found for ${owner.slice(0, 8)}... - create one in the dashboard first`);
   }
   
   if (pool.isLocked) {
