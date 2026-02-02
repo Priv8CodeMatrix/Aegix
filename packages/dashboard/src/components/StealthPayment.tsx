@@ -591,6 +591,22 @@ export default function StealthPayment({
         // Update pool state with fresh balance
         setPool(prev => prev ? { ...prev, balance: freshBalance } : null);
         
+        // ═══════════════════════════════════════════════════════════════════════════
+        // CRITICAL FIX: If user has NO shielded funds but HAS regular USDC, prompt to shield!
+        // Don't try standard payment - it requires more SOL and confuses users
+        // ═══════════════════════════════════════════════════════════════════════════
+        if (!hasSomeShielded && hasEnoughRegular) {
+          console.log('[Payment] User has regular USDC but no shielded - prompting to shield');
+          setShieldingInfo({
+            regularUsdc,
+            compressedUsdc: 0,
+            required: paymentAmount,
+          });
+          setNeedsShielding(true);
+          setError(`Your USDC is not shielded yet! Shield ${paymentAmount.toFixed(2)} USDC to enable privacy payments. Click "SHIELD_FUNDS" below.`);
+          return;
+        }
+        
         // If user has SOME shielded funds but NOT ENOUGH for this payment, prompt to shield more
         if (hasSomeShielded && !hasEnoughShielded && hasEnoughRegular) {
           const shortfall = paymentAmount - compressedUsdc;
@@ -600,7 +616,7 @@ export default function StealthPayment({
             required: paymentAmount,
           });
           setNeedsShielding(true);
-          setError(`Payment requires ${paymentAmount.toFixed(2)} USDC but you only have ${compressedUsdc.toFixed(2)} shielded. Shield ${shortfall.toFixed(2)} more USDC or use Standard payment.`);
+          setError(`Payment requires ${paymentAmount.toFixed(2)} USDC but you only have ${compressedUsdc.toFixed(2)} shielded. Shield ${shortfall.toFixed(2)} more USDC.`);
           return;
         }
         
