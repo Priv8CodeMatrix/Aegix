@@ -621,18 +621,36 @@ export function getRecoveryPoolAddress(owner: string): PublicKey {
 
 /**
  * Get Recovery Pool SOL balance for an owner
+ * Checks MULTIPLE sources: old registry, simple keypairs, stealth pool data
  */
 export async function getRecoveryPoolBalanceForOwner(owner: string, conn?: Connection): Promise<number> {
+  // Check MULTIPLE sources for Recovery Pool address
   const pool = getRecoveryPoolForOwner(owner);
-  if (!pool) return 0;
+  const simpleKeypair = getStoredRecoveryKeypair(owner);
   
-  const useConn = conn || connection;
+  let recoveryAddress: string | null = null;
+  
+  if (pool) {
+    recoveryAddress = pool.publicKey;
+  } else if (simpleKeypair) {
+    recoveryAddress = simpleKeypair.publicKey.toBase58();
+  } else {
+    // Try to get from stealth pool data
+    try {
+      const { getRecoveryPoolAddressFromStealthPool } = await import('../stealth/index.js');
+      recoveryAddress = getRecoveryPoolAddressFromStealthPool(owner);
+    } catch (e) {}
+  }
+  
+  if (!recoveryAddress) return 0;
+  
+  const useConn = conn || recoveryConnection || connection;
   if (!useConn) {
     throw new Error('No connection available');
   }
   
   try {
-    const balance = await useConn.getBalance(new PublicKey(pool.publicKey));
+    const balance = await useConn.getBalance(new PublicKey(recoveryAddress));
     return balance / LAMPORTS_PER_SOL;
   } catch (error) {
     console.error(`[Recovery] Failed to get balance for ${owner.slice(0, 8)}...:`, error);
@@ -642,6 +660,7 @@ export async function getRecoveryPoolBalanceForOwner(owner: string, conn?: Conne
 
 /**
  * Validate Recovery Pool liquidity for an owner
+ * Checks MULTIPLE sources: old registry, simple keypairs, stealth pool data
  */
 export async function validateRecoveryLiquidity(owner: string, conn?: Connection): Promise<{
   valid: boolean;
@@ -651,9 +670,33 @@ export async function validateRecoveryLiquidity(owner: string, conn?: Connection
   initialized: boolean;
   isLocked: boolean;
 }> {
+  // Check MULTIPLE sources for Recovery Pool address:
   const pool = getRecoveryPoolForOwner(owner);
+  const simpleKeypair = getStoredRecoveryKeypair(owner);
   
-  if (!pool) {
+  // Import from stealth to check persisted address
+  let stealthPoolAddress: string | null = null;
+  try {
+    const { getRecoveryPoolAddressFromStealthPool } = await import('../stealth/index.js');
+    stealthPoolAddress = getRecoveryPoolAddressFromStealthPool(owner);
+  } catch (e) {}
+  
+  // Determine Recovery Pool address from any source
+  let recoveryAddress: string | null = null;
+  let isLocked = false;
+  
+  if (pool) {
+    recoveryAddress = pool.publicKey;
+    isLocked = pool.isLocked || false;
+  } else if (simpleKeypair) {
+    recoveryAddress = simpleKeypair.publicKey.toBase58();
+  } else if (stealthPoolAddress) {
+    recoveryAddress = stealthPoolAddress;
+  }
+  
+  // No Recovery Pool found at all
+  if (!recoveryAddress) {
+    console.log(`[Recovery] validateRecoveryLiquidity: No pool found for ${owner.slice(0, 8)}...`);
     return {
       valid: false,
       balance: 0,
@@ -664,7 +707,30 @@ export async function validateRecoveryLiquidity(owner: string, conn?: Connection
     };
   }
   
-  const balance = await getRecoveryPoolBalanceForOwner(owner, conn);
+  // Fetch REAL on-chain balance
+  const connection = conn || recoveryConnection;
+  if (!connection) {
+    console.error('[Recovery] No connection available for balance check');
+    return {
+      valid: false,
+      balance: 0,
+      required: MIN_LIQUIDITY_SOL,
+      shortfall: MIN_LIQUIDITY_SOL,
+      initialized: true,
+      isLocked,
+    };
+  }
+  
+  let balance = 0;
+  try {
+    const pubkey = new PublicKey(recoveryAddress);
+    const lamports = await connection.getBalance(pubkey);
+    balance = lamports / 1_000_000_000; // LAMPORTS_PER_SOL
+    console.log(`[Recovery] validateRecoveryLiquidity: ${recoveryAddress.slice(0, 12)}... has ${balance.toFixed(4)} SOL`);
+  } catch (e) {
+    console.error(`[Recovery] Failed to fetch balance for ${recoveryAddress}:`, e);
+  }
+  
   const valid = balance >= MIN_LIQUIDITY_SOL;
   
   return {
@@ -673,7 +739,7 @@ export async function validateRecoveryLiquidity(owner: string, conn?: Connection
     required: MIN_LIQUIDITY_SOL,
     shortfall: valid ? undefined : MIN_LIQUIDITY_SOL - balance,
     initialized: true,
-    isLocked: pool.isLocked || false,
+    isLocked,
   };
 }
 
